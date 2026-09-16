@@ -37,6 +37,7 @@ indexmap = { version = "2.14.0", features = ["serde"] }
 inquire = "0.9.4"
 itertools = "0.14.0"
 libc = "0.2"
+libreadability = "0.2.0"
 libsqlite3-sys = { version = "0.37.0", features = ["bundled", "bundled-windows"] }
 log = "0.4.34"
 logos = "0.16.1"
@@ -70,6 +71,7 @@ tui-logger = { version = "0.18.3", features = ["crossterm"] }
 tui-markdown = "0.3.9"
 tui-prompts = "0.6.7"
 tui-tree-widget = "0.24.1"
+unicode-width = "0.2"
 url = "2.5.8"
 webbrowser = "1.2.4"
 shellexpand = "3.1.2"

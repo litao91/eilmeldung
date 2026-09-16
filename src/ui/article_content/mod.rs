@@ -1,3 +1,4 @@
+mod content_layout;
 mod model;
 mod view;
 
@@ -50,7 +51,12 @@ impl ArticleContent {
         article_id: Option<&ArticleID>,
     ) -> color_eyre::Result<bool> {
         let article_changed = self.model_data.on_article_selected(article_id).await?;
+        if self.view_data.rendered_inline_images() {
+            // Graphics protocols leave pixels behind that ratatui's cell diffing cannot erase.
+            self.message_sender.send(Message::Command(Command::Clear))?;
+        }
         self.view_data.clear_image();
+        self.view_data.clear_content_images();
         self.view_data.scroll_to_top();
         self.view_data.update(&self.model_data, self.config.clone());
         self.update_thumbnail_fetching_state()?;
@@ -72,7 +78,30 @@ impl ArticleContent {
     }
 
     fn scrape_article(&mut self) -> color_eyre::Result<()> {
-        self.model_data.scrape_article()?;
+        self.model_data.scrape_article(&self.config)?;
+        Ok(())
+    }
+
+    /// The `libreadability` path failed, so retry with news-flash's own scraper and tell the user
+    /// once what happened.
+    fn fall_back_to_newsflash_scraper(
+        &mut self,
+        error: &AsyncOperationError,
+    ) -> color_eyre::Result<()> {
+        if !self.model_data.scrape_article_with_newsflash() {
+            return Ok(());
+        }
+
+        if self.model_data.take_extract_fallback_notification() {
+            tooltip(
+                &self.message_sender,
+                &*format!(
+                    "extracting article content failed ({error}); falling back to the news-flash scraper"
+                ),
+                TooltipFlavor::Warning,
+            )?;
+        }
+
         Ok(())
     }
 
@@ -91,6 +120,39 @@ impl ArticleContent {
             self.view_data.reset_thumbnail_throbber();
         }
         Ok(())
+    }
+
+    /// Encode images requested during the last paint and start downloads for images the content
+    /// refers to but nothing is known about yet. Returns whether a redraw is worthwhile.
+    fn update_content_image_state(&mut self) -> color_eyre::Result<bool> {
+        let encoded = self.view_data.build_requested_protocols(&self.model_data);
+        let started = self.start_content_image_fetch();
+        Ok(encoded || started)
+    }
+
+    fn start_content_image_fetch(&mut self) -> bool {
+        if !self.config.content_show_images
+            || *self.model_data.content_image_fetch_running()
+            || !self.model_data.content_image_debounce_elapsed(&self.config)
+        {
+            return false;
+        }
+
+        let discovered = self.view_data.discovered_image_urls().to_vec();
+        let urls = self.model_data.pending_content_image_urls(&discovered);
+        if urls.is_empty() {
+            return false;
+        }
+
+        let base_url = self
+            .model_data
+            .article()
+            .as_ref()
+            .and_then(|article| article.url.as_ref())
+            .map(|url| url.as_str().to_owned());
+
+        self.model_data.start_fetch_content_images(urls, base_url);
+        true
     }
 
     fn share_url(&self, target_str: &str, title: &str, url: &Url) -> color_eyre::Result<()> {
@@ -418,6 +480,10 @@ impl crate::messages::MessageReceiver for ArticleContent {
                         self.view_data.clear_image();
                         self.model_data.on_thumbnail_fetch_failed();
                         view_needs_update = true;
+                    } else if let Event::AsyncArticleExtract = *reason.as_ref() {
+                        log::debug!("extracting article content not successful: {err}");
+                        self.fall_back_to_newsflash_scraper(err)?;
+                        view_needs_update = true;
                     }
                 }
 
@@ -432,6 +498,24 @@ impl crate::messages::MessageReceiver for ArticleContent {
                     self.model_data
                         .get_or_create_markdown_content(&self.config)?;
                     view_needs_update = true;
+                }
+
+                // Must stay above the `caused_model_update` guard further down: an arm placed
+                // after a guarded arm is unreachable and rustc does not warn about it.
+                AsyncArticleExtractFinished(extracted) => {
+                    self.model_data.on_extract_finished(extracted);
+                    self.model_data
+                        .get_or_create_markdown_content(&self.config)?;
+                    view_needs_update = true;
+                }
+
+                AsyncContentImageFetchFinished(image) => {
+                    self.model_data.on_content_image_finished(image);
+                    view_needs_update = true;
+                }
+
+                AsyncContentImagesFetchFinished(article_id) => {
+                    self.model_data.on_content_images_finished(article_id);
                 }
 
                 ApplicationStateChanged(state) => {
@@ -453,7 +537,9 @@ impl crate::messages::MessageReceiver for ArticleContent {
                 }
 
                 Tick => {
-                    view_needs_update = self.update_thumbnail_fetching_state()?;
+                    let thumbnail_fetching = self.update_thumbnail_fetching_state()?;
+                    let images_changed = self.update_content_image_state()?;
+                    view_needs_update = thumbnail_fetching || images_changed;
                 }
 
                 MouseScrollDown(Panel::ArticleContent) => {
@@ -474,6 +560,8 @@ impl crate::messages::MessageReceiver for ArticleContent {
 
                 ConfigReloaded(config) => {
                     self.config = Arc::clone(config);
+                    // Themes, icons and hint settings all feed the rendered rows.
+                    self.view_data.invalidate_layout();
                     view_needs_update = true;
                 }
 

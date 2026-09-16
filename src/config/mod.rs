@@ -32,7 +32,7 @@ pub mod prelude {
     pub use super::share_target::ShareTarget;
     pub use super::sync_stats::SyncStatsOutputFormat;
     pub use super::theme::Theme;
-    pub use super::{ArticleContentType, ArticleScope, Config, ConfigError};
+    pub use super::{ArticleContentType, ArticleScope, Config, ConfigError, ContentFetcher};
 }
 
 use log::{info, warn};
@@ -77,6 +77,18 @@ pub enum ConfigError {
 pub enum ArticleContentType {
     PlainText,
     Markdown,
+}
+
+/// Which extractor produces the full content of an article.
+#[derive(Debug, Copy, Clone, serde::Deserialize, Eq, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentFetcher {
+    /// Fetch the page with the built-in HTTP client and extract the article body with
+    /// `libreadability`, a port of Mozilla's Readability algorithm.
+    #[default]
+    Readability,
+    /// news-flash's own scraper (`article_scraper`).
+    Newsflash,
 }
 
 #[derive(Debug, Copy, Clone, serde::Deserialize, Eq, PartialEq)]
@@ -190,6 +202,10 @@ pub struct Config {
     pub thumbnail_fetch_debounce_millis: u64,
     pub text_max_width: u16,
     pub content_preferred_type: ArticleContentType,
+    pub content_fetcher: ContentFetcher,
+    pub content_show_images: bool,
+    pub content_image_max_height: u16,
+    pub content_image_debounce_millis: u64,
     pub hide_default_sort_order: bool,
     pub default_sort_order: SortOrder,
     pub zen_mode_show_header: bool,
@@ -335,6 +351,10 @@ impl Default for Config {
             thumbnail_fetch_debounce_millis: 500,
             text_max_width: 66,
             content_preferred_type: ArticleContentType::Markdown,
+            content_fetcher: ContentFetcher::Readability,
+            content_show_images: true,
+            content_image_max_height: 12,
+            content_image_debounce_millis: 500,
             zen_mode_show_header: false,
             content_show_urls: false,
             hint_type: HintType::Letters,
@@ -391,5 +411,53 @@ impl Default for Config {
             scrollbar_track_symbol: None,
             scrollbar_thumb_symbol: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// `Config` is `deny_unknown_fields`, so a key in the shipped example that no longer matches
+    /// the struct would break everyone who copies that file.
+    #[test]
+    fn the_example_config_deserializes() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/default-config.toml");
+
+        let parsed = config::Config::builder()
+            .add_source(config::File::new(path, config::FileFormat::Toml))
+            .build()
+            .expect("examples/default-config.toml is valid TOML")
+            .try_deserialize::<Config>();
+
+        assert!(
+            parsed.is_ok(),
+            "examples/default-config.toml no longer matches `Config`: {:?}",
+            parsed.err()
+        );
+    }
+
+    #[test]
+    fn the_example_config_matches_the_defaults_for_new_options() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/default-config.toml");
+
+        let parsed = config::Config::builder()
+            .add_source(config::File::new(path, config::FileFormat::Toml))
+            .build()
+            .expect("examples/default-config.toml is valid TOML")
+            .try_deserialize::<Config>()
+            .expect("examples/default-config.toml matches `Config`");
+
+        let defaults = Config::default();
+        assert_eq!(defaults.content_fetcher, parsed.content_fetcher);
+        assert_eq!(defaults.content_show_images, parsed.content_show_images);
+        assert_eq!(
+            defaults.content_image_max_height,
+            parsed.content_image_max_height
+        );
+        assert_eq!(
+            defaults.content_image_debounce_millis,
+            parsed.content_image_debounce_millis
+        );
     }
 }

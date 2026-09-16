@@ -29,6 +29,8 @@
 - [Notify After Sync](#notification-after-sync)
 - [Share Target Configuration](#share-target-configuration)
 - [Opening Enclosures](#opening-enclosures)
+- [Article Content](#article-content)
+  - [Inline Images](#inline-images)
 - [Layout Configuration](#layout-configuration)
   - [Example: Static Layout (default)](#example-static-layout-default)
   - [Example: Dynamic Layout](#example-dynamic-layout)
@@ -140,6 +142,10 @@ Afterwards, auto-reloading should work.
 | `content_show_position`           | boolean               | Show position indicator in article content (bottom right)                                                                                                          |
 | `text_max_width`                  | integer               | Maximum text width for article content                                                                                                                             |
 | `content_preferred_type`          | string                | Preferred content type: `"plain_text"` or `"markdown"`                                                                                                             |
+| `content_fetcher`                 | string                | Which extractor fetches the full article content: `"readability"` or `"newsflash"`                                                                                 |
+| `content_show_images`             | boolean               | Draw images inside the article content inline rather than as link hints                                                                                            |
+| `content_image_max_height`        | integer               | Maximum number of rows an inline content image may occupy                                                                                                          |
+| `content_image_debounce_millis`   | integer               | Delay before downloading the images of an article (ms)                                                                                                             |
 | `feed_list_focused_width`         | dimension             | Width of feed list when focused                                                                                                                                    |
 | `article_list_focused_width`      | dimension             | Width of article list when focused                                                                                                                                 |
 | `article_list_focused_height`     | dimension             | Height of article list when focused                                                                                                                                |
@@ -841,6 +847,30 @@ video_enclosure_command = "mpv {url}"
 ```
 
 Note: These commands support [environment variable expansion](#variable-expansion).
+
+
+## Article Content
+
+When you open an article, *eilmeldung* fetches its web page and extracts the body. Two extractors are available through `content_fetcher`:
+
+- `"readability"` (the default): the page is fetched with *eilmeldung*'s own HTTP client and the body is extracted with [libreadability](https://crates.io/crates/libreadability), a port of Mozilla's Readability algorithm. Navigation, cookie banners, sidebars, footers, forms, inline styles and tracking scripts are removed, and relative image URLs are resolved against the page.
+- `"newsflash"`: extraction is left to news-flash's own scraper. This is what *eilmeldung* did before `content_fetcher` existed.
+
+If extraction with `readability` fails — the page cannot be fetched, or nothing readable is found in it — *eilmeldung* falls back to news-flash's scraper automatically and says so once in the status bar.
+
+Neither extractor executes JavaScript. A page that builds its article body client-side may therefore still come back mostly empty, and in that case switching extractors will not help.
+
+### Inline Images
+
+With `content_show_images = true` (the default), images inside the article body are downloaded and drawn in the terminal at the position they occupy in the text, scaled to their aspect ratio and limited to `content_image_max_height` rows. Images smaller than 64 pixels in either dimension are treated as icons or tracking pixels and stay link hints.
+
+Drawing images needs a terminal with a graphics protocol: *kitty*, *iTerm2*, or anything supporting *sixel*. Without one, *eilmeldung* falls back to half-block characters, which is legible but coarse.
+
+Downloads start `content_image_debounce_millis` after an article is selected, so that browsing through a list quickly does not fetch every article's images. At most 24 images per article are downloaded, of at most 8 MiB each. The bytes are cached across articles (64 images / 48 MiB), so revisiting an article re-draws them without downloading again.
+
+An image that could not be downloaded stays a link hint, which shifts the hints of the links following it. An image that *is* drawn gets no hint, since there is nothing left to open externally.
+
+Inline images apply to the markdown rendering path, so they need `content_preferred_type = "markdown"` (the default).
 
 
 ## Layout Configuration

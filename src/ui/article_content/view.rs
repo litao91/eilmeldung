@@ -1,8 +1,11 @@
+use super::content_layout::{
+    ContentImageRef, ContentRow, IMAGE_SENTINEL, build_rows, image_cell_size,
+};
 use super::model::ArticleContentModelData;
 use crate::prelude::*;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::Cursor,
     sync::{Arc, Mutex},
 };
@@ -11,15 +14,51 @@ use getset::{Getters, MutGetters};
 use image::ImageReader;
 use log::info;
 use news_flash::models::Enclosure;
-use ratatui::layout::Flex;
+use ratatui::layout::{Flex, Size};
 use ratatui_image::{
-    FilterType, Resize, StatefulImage, picker::Picker, protocol::StatefulProtocol,
+    FilterType, FontSize, Resize, StatefulImage,
+    picker::Picker,
+    protocol::StatefulProtocol,
+    sliced::{SignedPosition, SlicedImage, SlicedProtocol},
 };
 use the_other_tui_markdown::RendererBuilder;
 use throbber_widgets_tui::{Throbber, ThrobberState, WhichUse};
 
 const NO_THUMB_PLACEHOLDER: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/no-thumb.png"));
+
+/// Everything a cached row layout was derived from. Any difference means the rows are stale.
+///
+/// Config changes that affect rendering are deliberately not part of the key: `ArticleContent`
+/// calls [`ArticleContentViewData::invalidate_layout`] on `ConfigReloaded` instead, which avoids
+/// comparing a whole `Config` or keying on a pointer that could be reused after a free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LayoutKey {
+    content_generation: u64,
+    width: u16,
+    font_width: u16,
+    font_height: u16,
+    max_image_rows: u16,
+    show_images: bool,
+}
+
+/// A content image encoded for one specific cell size and picker generation.
+struct BuiltImage {
+    protocol: SlicedProtocol,
+    columns: u16,
+    rows: u16,
+    picker_generation: u64,
+}
+
+/// Scratch space shared with the markdown renderer's image hook.
+struct ImageHookState {
+    /// URLs that are already downloaded, with their pixel dimensions.
+    loaded: HashMap<String, (u32, u32)>,
+    /// Images the hook decided to draw, in document order.
+    ordered: Vec<ContentImageRef>,
+    /// Every image URL the document referred to, in document order.
+    discovered: Vec<String>,
+}
 
 #[derive(Getters, MutGetters)]
 pub struct ArticleContentViewData {
@@ -42,6 +81,24 @@ pub struct ArticleContentViewData {
 
     #[getset(get = "pub(super)")]
     url_for_hint: HashMap<String, String>,
+
+    // Cached row layout. Rendering the markdown used to happen on every frame; it now happens
+    // only when `layout_key` changes, which makes steady-state frames cheaper than before.
+    rows: Vec<ContentRow>,
+    total_height: u16,
+    layout_key: Option<LayoutKey>,
+
+    // Inline image bookkeeping belonging to the cached layout.
+    content_image_order: Vec<ContentImageRef>,
+    discovered_image_urls: Vec<String>,
+    content_image_protocols: HashMap<String, BuiltImage>,
+    /// URLs whose encoding failed, so that they are not retried on every frame.
+    failed_protocols: HashSet<String>,
+    /// Sizes recorded while painting, drained and encoded between frames so that the blocking
+    /// encode never happens on the render path.
+    protocol_requests: HashSet<(String, u16, u16)>,
+    picker_generation: u64,
+    rendered_inline_images: bool,
 }
 
 impl Default for ArticleContentViewData {
@@ -65,6 +122,16 @@ impl Default for ArticleContentViewData {
             thumbnail_fetching_throbber: ThrobberState::default(),
             scrollbar_state: ScrollbarState::default(),
             url_for_hint: Default::default(),
+            rows: Vec::new(),
+            total_height: 0,
+            layout_key: None,
+            content_image_order: Vec::new(),
+            discovered_image_urls: Vec::new(),
+            content_image_protocols: HashMap::new(),
+            failed_protocols: HashSet::new(),
+            protocol_requests: HashSet::new(),
+            picker_generation: 0,
+            rendered_inline_images: false,
         }
     }
 }
@@ -143,10 +210,11 @@ impl ArticleContentViewData {
             })
             .title_bottom(
                 if self.max_scroll > 0 && config.content_show_position {
-                    Line::styled(
-                        format!(" {}% ", (self.vertical_scroll * 100) / self.max_scroll),
-                        config.theme.header(),
-                    )
+                    // u32 because a long article can have more than 655 wrapped rows, which would
+                    // overflow the u16 multiplication.
+                    let percent =
+                        (u32::from(self.vertical_scroll) * 100) / u32::from(self.max_scroll);
+                    Line::styled(format!(" {percent}% "), config.theme.header())
                 } else {
                     "".into()
                 }
@@ -435,66 +503,338 @@ impl ArticleContentViewData {
             .constraints([text_constraint])
             .areas(content_area);
 
-        // prefer filtered content
-        let text: Text<'_> = if let Some(filtered_markdown_content) =
-            model_data.filtered_markdown_content().as_deref()
-        {
-            self.markdown_to_text(filtered_markdown_content, config)
-        } else if config.content_preferred_type == ArticleContentType::Markdown
-            && let Some(html) = model_data
-                .fat_article()
-                .as_ref()
-                .and_then(|fat_article| fat_article.scraped_content.as_deref())
-        {
-            // Use the cached markdown content from model
-            if let Some(markdown) = model_data.markdown_content() {
-                info!("markdown available");
-                self.markdown_to_text(markdown, config)
+        self.ensure_rows(model_data, config, paragraph_area.width);
 
-                // tui_markdown::from_str(markdown)
-            } else {
-                info!("no markdown available, falling back to html2text");
-                // Fallback - convert to plain text instead of markdown to avoid lifetime issues
-                let plain_text = news_flash::util::html2text::html2text(html);
-                Text::from(plain_text)
-            }
-        } else if let Some(plain_text) = model_data
-            .fat_article()
-            .as_ref()
-            .and_then(|fat_article| fat_article.plain_text.as_deref())
-        {
-            info!("rendering plain text content");
-            Text::from(plain_text)
-        } else {
-            info!("no content available");
-            Text::from("no content available")
-        };
-
-        // Calculate the total number of lines the content would take when wrapped
-        let content_lines = Self::calculate_wrapped_lines(&text, paragraph_area.width);
-
-        // Calculate maximum scroll (ensure it doesn't go negative)
-        let max_scroll = content_lines.saturating_sub(paragraph_area.height);
-
-        // Ensure current scroll doesn't exceed maximum
+        // `total_height` counts image rows as well as text rows, so content below a tall image is
+        // still reachable.
+        let max_scroll = self.total_height.saturating_sub(paragraph_area.height);
         let vertical_scroll = vertical_scroll.min(max_scroll);
 
-        let content = Paragraph::new(text)
-            .wrap(Wrap { trim: true })
-            .scroll((vertical_scroll, 0));
-
-        content.render(paragraph_area, buf);
+        self.paint_rows(
+            paragraph_area,
+            vertical_scroll,
+            self.picker.font_size(),
+            config,
+            buf,
+        );
 
         self.max_scroll = max_scroll;
         self.vertical_scroll = vertical_scroll;
     }
 
-    fn markdown_to_text(&mut self, markdown: &str, config: &Config) -> Text<'static> {
+    /// Rebuild the row layout if anything it depends on has changed.
+    ///
+    /// This is the only place the markdown is rendered, so the per-frame cost of parsing and
+    /// wrapping the whole article is paid once per change rather than once per frame.
+    fn ensure_rows(&mut self, model_data: &ArticleContentModelData, config: &Config, width: u16) {
+        let font = self.picker.font_size();
+        let key = LayoutKey {
+            content_generation: *model_data.content_generation(),
+            width,
+            font_width: font.width,
+            font_height: font.height,
+            max_image_rows: config.content_image_max_height,
+            show_images: config.content_show_images,
+        };
+
+        if self.layout_key == Some(key) {
+            return;
+        }
+
+        let text = self.content_as_text(model_data, config);
+        let draw_images = config.content_show_images;
+        let max_image_rows = config.content_image_max_height;
+
+        let (rows, total_height) = build_rows(text, &self.content_image_order, width, |image| {
+            if !draw_images {
+                return 0;
+            }
+            image_cell_size(image.px_width, image.px_height, width, font, max_image_rows).1
+        });
+
+        self.rows = rows;
+        self.total_height = total_height;
+        self.layout_key = Some(key);
+    }
+
+    /// Pick the content to render and turn it into styled text.
+    ///
+    /// Also refreshes `content_image_order`, `discovered_image_urls` and `url_for_hint` as a side
+    /// effect of the markdown renderer's hooks.
+    fn content_as_text(
+        &mut self,
+        model_data: &ArticleContentModelData,
+        config: &Config,
+    ) -> Text<'static> {
+        // Only URLs discovered by a previous pass can be looked up, so a freshly loaded article
+        // renders its images as hint links first; once the downloads land, the content generation
+        // changes and this pass emits them as images instead.
+        //
+        // Images whose encoding failed are excluded so that they fall back to being a hint link
+        // rather than a blank gap.
+        let loaded_images = self
+            .discovered_image_urls
+            .iter()
+            .filter(|url| !self.failed_protocols.contains(*url))
+            .filter_map(|url| {
+                model_data
+                    .content_image_dimensions(url)
+                    .map(|dimensions| (url.clone(), dimensions))
+            })
+            .collect::<HashMap<String, (u32, u32)>>();
+
+        let draw_images = config.content_show_images;
+
+        // prefer filtered content
+        if let Some(filtered_markdown_content) = model_data.filtered_markdown_content().as_deref() {
+            return self.markdown_to_text(
+                filtered_markdown_content,
+                config,
+                loaded_images,
+                draw_images,
+            );
+        }
+
+        if config.content_preferred_type == ArticleContentType::Markdown
+            && let Some(scraped) = model_data
+                .fat_article()
+                .as_ref()
+                .and_then(|fat_article| fat_article.scraped_content.as_deref())
+        {
+            // Use the cached markdown content from model
+            if let Some(markdown) = model_data.markdown_content().as_deref() {
+                info!("markdown available");
+                return self.markdown_to_text(markdown, config, loaded_images, draw_images);
+            }
+
+            info!("no markdown available, falling back to html2text");
+            // Fallback - convert to plain text instead of markdown to avoid lifetime issues
+            return Text::from(news_flash::util::html2text::html2text(scraped));
+        }
+
+        if let Some(plain_text) = model_data
+            .fat_article()
+            .as_ref()
+            .and_then(|fat_article| fat_article.plain_text.as_deref())
+        {
+            info!("rendering plain text content");
+            return Text::from(plain_text.to_owned());
+        }
+
+        info!("no content available");
+        Text::from("no content available")
+    }
+
+    /// Paint the cached rows into the viewport.
+    ///
+    /// Image rows whose protocol is not encoded yet are left blank and their size is recorded, so
+    /// that the encoding happens between frames; `SlicedImage` blocks the calling thread while it
+    /// encodes, and rendering runs on the UI thread.
+    fn paint_rows(
+        &mut self,
+        area: Rect,
+        vertical_scroll: u16,
+        font: FontSize,
+        config: &Config,
+        buf: &mut Buffer,
+    ) {
+        let max_image_rows = config.content_image_max_height;
+        let scroll = i32::from(vertical_scroll);
+        let bottom = scroll.saturating_add(i32::from(area.height));
+        let picker_generation = self.picker_generation;
+
+        let mut row_top = 0i32;
+        let mut requests: Vec<(String, u16, u16)> = Vec::new();
+        let mut drew_image = false;
+
+        for row in &self.rows {
+            let height = i32::from(row.height());
+
+            if row_top.saturating_add(height) <= scroll {
+                row_top += height;
+                continue;
+            }
+            if row_top >= bottom {
+                break;
+            }
+
+            let offset = row_top.saturating_sub(scroll);
+
+            match row {
+                ContentRow::Text(line) => {
+                    let row_area =
+                        Rect::new(area.x, area.y.saturating_add(offset as u16), area.width, 1);
+                    line.render(row_area, buf);
+                }
+                ContentRow::Image {
+                    index,
+                    height: image_rows,
+                } => {
+                    let Some(image) = self.content_image_order.get(*index) else {
+                        row_top += height;
+                        continue;
+                    };
+
+                    let (columns, _) = image_cell_size(
+                        image.px_width,
+                        image.px_height,
+                        area.width,
+                        font,
+                        max_image_rows,
+                    );
+                    if columns == 0 {
+                        row_top += height;
+                        continue;
+                    }
+
+                    let ready = self
+                        .content_image_protocols
+                        .get(&image.url)
+                        .is_some_and(|built| {
+                            built.columns == columns
+                                && built.rows == *image_rows
+                                && built.picker_generation == picker_generation
+                        });
+
+                    if !ready {
+                        requests.push((image.url.clone(), columns, *image_rows));
+                        row_top += height;
+                        continue;
+                    }
+
+                    // Safe: `ready` was only true because the lookup succeeded.
+                    let built = &self.content_image_protocols[&image.url];
+                    let x = area.width.saturating_sub(columns) / 2;
+                    // Unlike a text row, an image can be scrolled partly off the top, so this is
+                    // deliberately signed: `SlicedImage` skips the hidden rows instead of
+                    // re-encoding or overdrawing the pane.
+                    let y = row_top - scroll;
+                    let position = SignedPosition::from((x as i16, y as i16));
+                    SlicedImage::new(&built.protocol, position).render(area, buf);
+                    drew_image = true;
+                }
+            }
+
+            row_top += height;
+        }
+
+        self.protocol_requests.extend(requests);
+        self.rendered_inline_images = drew_image;
+    }
+
+    /// Encode the images requested during the last paint. Returns whether anything changed, so
+    /// that the caller can ask for a redraw.
+    pub(super) fn build_requested_protocols(
+        &mut self,
+        model_data: &ArticleContentModelData,
+    ) -> bool {
+        if self.protocol_requests.is_empty() {
+            return false;
+        }
+
+        let requests = std::mem::take(&mut self.protocol_requests);
+        let mut built_any = false;
+
+        for (url, columns, rows) in requests {
+            if self.content_image_protocols.contains_key(&url)
+                || self.failed_protocols.contains(&url)
+            {
+                continue;
+            }
+
+            let Some(data) = model_data.content_image_data(&url) else {
+                continue;
+            };
+
+            match Self::build_sliced_protocol(&self.picker, data, columns, rows) {
+                Ok(protocol) => {
+                    self.content_image_protocols.insert(
+                        url,
+                        BuiltImage {
+                            protocol,
+                            columns,
+                            rows,
+                            picker_generation: self.picker_generation,
+                        },
+                    );
+                    built_any = true;
+                }
+                Err(error) => {
+                    log::warn!("could not prepare content image {url} for display: {error}");
+                    self.failed_protocols.insert(url);
+                    // The layout committed to drawing this image, so it has to be rebuilt to put
+                    // the hint link back instead of leaving a blank gap.
+                    self.invalidate_layout();
+                }
+            }
+        }
+
+        built_any
+    }
+
+    fn build_sliced_protocol(
+        picker: &Picker,
+        data: &[u8],
+        columns: u16,
+        rows: u16,
+    ) -> color_eyre::Result<SlicedProtocol> {
+        let image = ImageReader::new(Cursor::new(data))
+            .with_guessed_format()?
+            .decode()?;
+        SlicedProtocol::new(picker, image, Some(Size::new(columns, rows))).map_err(|error| {
+            color_eyre::eyre::eyre!("could not encode the image for the terminal: {error}")
+        })
+    }
+
+    /// Every image URL the rendered content refers to, in document order.
+    pub(super) fn discovered_image_urls(&self) -> &[String] {
+        &self.discovered_image_urls
+    }
+
+    /// Whether the last paint actually drew an image.
+    ///
+    /// Graphics protocols leave pixels that ratatui's cell diffing cannot erase, so this gates the
+    /// full-terminal clears.
+    pub(super) fn rendered_inline_images(&self) -> bool {
+        self.rendered_inline_images
+    }
+
+    /// Drop the cached layout so that the next paint rebuilds it.
+    pub(super) fn invalidate_layout(&mut self) {
+        self.layout_key = None;
+    }
+
+    /// Forget everything about the previous article's inline images.
+    ///
+    /// The downloaded bytes stay in the model, keyed by URL, so revisiting an article only has to
+    /// re-encode rather than re-download.
+    pub(super) fn clear_content_images(&mut self) {
+        self.content_image_order.clear();
+        self.discovered_image_urls.clear();
+        self.content_image_protocols.clear();
+        self.failed_protocols.clear();
+        self.protocol_requests.clear();
+        self.rendered_inline_images = false;
+        self.invalidate_layout();
+    }
+
+    fn markdown_to_text(
+        &mut self,
+        markdown: &str,
+        config: &Config,
+        loaded_images: HashMap<String, (u32, u32)>,
+        draw_images: bool,
+    ) -> Text<'static> {
         let url_for_hint = Arc::new(Mutex::new(HashMap::<String, String>::new()));
         // unwrap is safe here: at least one symbol passed save here
         let iterator = config.hint_type.iter();
         let hint_iterator = Arc::new(Mutex::new(iterator));
         let show_url = config.content_show_urls;
+        let hook_state = Arc::new(Mutex::new(ImageHookState {
+            loaded: loaded_images,
+            ordered: Vec::new(),
+            discovered: Vec::new(),
+        }));
 
         let inner_link_url_for_hint = url_for_hint.clone();
         let inner_link_hint_iterator = hint_iterator.clone();
@@ -508,6 +848,7 @@ impl ArticleContentViewData {
 
         let inner_image_url_for_hint = url_for_hint.clone();
         let inner_image_hint_iterator = hint_iterator.clone();
+        let image_hook_state = Arc::clone(&hook_state);
         let image_alt_text_style = Style::new()
             .fg(*config.theme.color_palette().accent_primary())
             .add_modifier(Modifier::UNDERLINED);
@@ -537,6 +878,31 @@ impl ArticleContentViewData {
                     spans
                 })
                 .with_image(move |alt, url| {
+                    let dimensions = {
+                        let mut hook_state = image_hook_state.lock().unwrap(); // unwrap is safe here: locking with sync calls
+                        if draw_images {
+                            hook_state.discovered.push(url.to_owned());
+                            let dimensions = hook_state.loaded.get(url).copied();
+                            if let Some((px_width, px_height)) = dimensions {
+                                hook_state.ordered.push(ContentImageRef {
+                                    url: url.to_owned(),
+                                    px_width,
+                                    px_height,
+                                });
+                            }
+                            dimensions
+                        } else {
+                            None
+                        }
+                    };
+
+                    if dimensions.is_some() {
+                        // Replaced by the drawn image: `build_rows` turns this span into an image
+                        // row at exactly this position in the document.
+                        return vec![Span::from(IMAGE_SENTINEL)];
+                    }
+
+                    // Not available to draw, so keep the hint link the reader can open externally.
                     let mut url_for_hint = inner_image_url_for_hint.lock().unwrap();
                     let hint = inner_image_hint_iterator.lock().unwrap().next().unwrap(); // unwrap is save here: locking with sync calls
                     url_for_hint
@@ -554,44 +920,30 @@ impl ArticleContentViewData {
                 })
                 .build();
 
-            the_other_tui_markdown::into_text_with_renderer(markdown, &renderer).to_owned()
+            the_other_tui_markdown::into_text_with_renderer(markdown, &renderer)
         };
 
+        {
+            let mut hook_state = hook_state.lock().unwrap(); // unwrap is safe here: locking with sync calls
+            self.content_image_order = std::mem::take(&mut hook_state.ordered);
+            self.discovered_image_urls = std::mem::take(&mut hook_state.discovered);
+        }
         self.url_for_hint = url_for_hint.lock().unwrap().to_owned();
 
         text
     }
 
-    fn calculate_wrapped_lines(text: &ratatui::text::Text, width: u16) -> u16 {
-        let mut total_lines = 0u16;
-
-        for line in text.lines.iter() {
-            if line.spans.is_empty() {
-                total_lines += 1;
-                continue;
-            }
-
-            let line_content: String = line
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect();
-
-            if line_content.is_empty() {
-                total_lines += 1;
-            } else {
-                // Calculate how many lines this content will take when wrapped
-                let line_width = line_content.chars().count() as u16;
-                let wrapped_lines = (line_width + width - 1) / width.max(1); // Ceiling division
-                total_lines += wrapped_lines.max(1);
-            }
-        }
-
-        total_lines
-    }
-
     pub fn picker_updated(&mut self, picker: &Picker) -> color_eyre::Result<()> {
         self.picker = picker.to_owned();
+
+        // Encoded images are tied to the cell size the picker reported, and that cell size also
+        // feeds the row heights, so both the protocols and the layout have to be rebuilt.
+        self.picker_generation += 1;
+        self.content_image_protocols.clear();
+        self.failed_protocols.clear();
+        self.protocol_requests.clear();
+        self.invalidate_layout();
+
         let cursor = Cursor::new(NO_THUMB_PLACEHOLDER);
         self.placeholder_image = self.picker.new_resize_protocol(
             ImageReader::new(cursor)

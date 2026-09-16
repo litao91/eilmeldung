@@ -10,8 +10,55 @@ use std::{
 use getset::Getters;
 use htmd::HtmlToMarkdown;
 use image::ImageReader;
+use indexmap::IndexMap;
 use news_flash::models::{Article, ArticleID, Enclosure, FatArticle, Feed, Tag, Thumbnail};
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
+
+/// How many extracted articles are kept in memory.
+///
+/// news-flash's own scraper caches scraped content on disk, so revisiting an article is free
+/// there. The `libreadability` path has no such cache, so without this an article would be
+/// re-fetched and re-extracted every time the selection returns to it.
+const EXTRACTED_CACHE_LIMIT: usize = 16;
+
+/// Content images smaller than this in either dimension are icons or tracking pixels and are left
+/// as text hints rather than drawn.
+const CONTENT_IMAGE_MIN_PIXELS: u32 = 64;
+
+/// How many content images are remembered across articles, keyed by URL.
+const CONTENT_IMAGE_CACHE_LIMIT: usize = 64;
+
+/// Combined size of the remembered content image bytes.
+const CONTENT_IMAGE_CACHE_BYTES: usize = 48 * 1024 * 1024;
+
+/// How many content image downloads are started for one article at a time.
+const CONTENT_IMAGE_BATCH_LIMIT: usize = 24;
+
+/// What is known about one content image URL.
+///
+/// Keyed by the URL exactly as it appeared in the markdown. Every state other than `Pending` is
+/// final, so a URL is never downloaded twice: that keeps a hotlink-protected or 404ing image from
+/// being retried on every tick.
+#[derive(Debug)]
+pub(super) enum ContentImageState {
+    Pending,
+    Loaded {
+        data: Vec<u8>,
+        width: u32,
+        height: u32,
+    },
+    /// Download or decode failed, or the image is too small to be worth drawing.
+    Unusable,
+}
+
+impl ContentImageState {
+    fn byte_len(&self) -> usize {
+        match self {
+            ContentImageState::Loaded { data, .. } => data.len(),
+            ContentImageState::Pending | ContentImageState::Unusable => 0,
+        }
+    }
+}
 
 #[derive(Getters)]
 #[getset(get = "pub(super)")]
@@ -25,6 +72,24 @@ pub struct ArticleContentModelData {
     tags: Option<Vec<Tag>>,
     fat_article: Option<FatArticle>,
     enclosures: Option<Vec<Enclosure>>,
+
+    #[getset(skip)]
+    extracted_cache: IndexMap<ArticleID, FatArticle>,
+    #[getset(skip)]
+    extract_fallback_notified: bool,
+
+    // Content images, keyed by the URL as it appeared in the markdown.
+    #[getset(skip)]
+    content_images: IndexMap<String, ContentImageState>,
+    #[getset(skip)]
+    content_image_bytes: usize,
+    content_image_fetch_running: bool,
+    #[getset(skip)]
+    image_fetch_abort: Option<tokio::task::AbortHandle>,
+
+    /// Bumped whenever anything that affects the rendered rows changes, so that the view can tell
+    /// that its cached layout is stale.
+    content_generation: u64,
 
     // Processed content
     markdown_content: Option<String>,
@@ -51,6 +116,13 @@ impl ArticleContentModelData {
             feed: None,
             tags: None,
             fat_article: None,
+            extracted_cache: IndexMap::new(),
+            extract_fallback_notified: false,
+            content_images: IndexMap::new(),
+            content_image_bytes: 0,
+            content_image_fetch_running: false,
+            image_fetch_abort: None,
+            content_generation: 0,
             markdown_content: None,
             filtered_markdown_content: None,
             thumbnail_fetch_successful: None,
@@ -78,11 +150,17 @@ impl ArticleContentModelData {
         self.instant_since_article_selected = Some(current_instant);
         self.thumbnail_fetch_successful = None;
         self.thumbnail = None;
-        self.fat_article = None;
+        self.abort_content_image_fetch();
+        // Restore previously extracted content instead of always dropping it, so that returning
+        // to an article does not trigger another fetch.
+        let cached =
+            article_id.and_then(|article_id| self.extracted_cache.get(article_id).cloned());
+        self.fat_article = cached;
         self.markdown_content = None;
         self.filtered_markdown_content = None;
         self.feed = None;
         self.tags = None;
+        self.content_generation += 1;
 
         match article_id {
             Some(article_id) => {
@@ -162,22 +240,250 @@ impl ArticleContentModelData {
         Ok(picker.new_resize_protocol(image))
     }
 
-    pub(super) fn scrape_article(&mut self) -> color_eyre::Result<()> {
+    pub(super) fn scrape_article(&mut self, config: &Config) -> color_eyre::Result<()> {
         let Some(article) = self.article.as_ref() else {
             return Ok(());
         };
 
-        if self.fat_article.is_none() {
-            let article_id = article.article_id.clone();
+        if self.fat_article.is_some() {
+            return Ok(());
+        }
+
+        let article_id = article.article_id.clone();
+
+        // Without a source URL there is nothing to fetch; news-flash handles that case itself.
+        if config.content_fetcher == ContentFetcher::Readability
+            && let Some(url) = article.url.as_ref()
+        {
+            self.news_flash_utils
+                .fetch_article_html(article_id, url.as_str().to_owned());
+        } else {
             self.news_flash_utils.fetch_fat_article(article_id);
         }
 
         Ok(())
     }
 
+    /// Retry with news-flash's own scraper after the `libreadability` path failed.
+    /// Returns whether a fetch was actually started.
+    pub(super) fn scrape_article_with_newsflash(&mut self) -> bool {
+        if self.fat_article.is_some() {
+            return false;
+        }
+
+        let Some(article) = self.article.as_ref() else {
+            return false;
+        };
+
+        self.news_flash_utils
+            .fetch_fat_article(article.article_id.clone());
+        true
+    }
+
+    /// Whether the user has already been told that extraction fell back to news-flash's scraper.
+    /// Returns `true` exactly once so that a failing extractor does not produce a tooltip per
+    /// article.
+    pub(super) fn take_extract_fallback_notification(&mut self) -> bool {
+        let notified = self.extract_fallback_notified;
+        self.extract_fallback_notified = true;
+        !notified
+    }
+
+    pub(super) fn on_extract_finished(&mut self, extracted: &ExtractedArticle) {
+        // Guard against a response for an article the user has already navigated away from.
+        if self.article.as_ref().map(|article| &article.article_id) != Some(&extracted.article_id) {
+            return;
+        }
+
+        let Some(article) = self.article.as_ref() else {
+            return;
+        };
+
+        // Mirror the article's own metadata, filling in title/author the way news-flash's scraper
+        // does, so that switching extractors does not change the header.
+        let fat_article = FatArticle {
+            article_id: article.article_id.clone(),
+            title: article
+                .title
+                .clone()
+                .or_else(|| extracted.title.clone())
+                .filter(|title| !title.trim().is_empty()),
+            author: article
+                .author
+                .clone()
+                .or_else(|| extracted.byline.clone())
+                .filter(|author| !author.trim().is_empty()),
+            feed_id: article.feed_id.clone(),
+            url: article.url.clone(),
+            date: article.date,
+            synced: article.synced,
+            html: None,
+            summary: article.summary.clone(),
+            direction: article.direction,
+            unread: article.unread,
+            marked: article.marked,
+            scraped_content: Some(extracted.content.clone()),
+            plain_text: Some(extracted.text_content.clone()),
+            thumbnail_url: article.thumbnail_url.clone(),
+            updated: article.updated,
+        };
+
+        self.cache_extracted(fat_article.clone());
+        self.set_fat_article(fat_article);
+    }
+
+    fn cache_extracted(&mut self, fat_article: FatArticle) {
+        // shift_remove first so that a re-extraction moves the entry to the back rather than
+        // keeping its old position and getting evicted early.
+        self.extracted_cache.shift_remove(&fat_article.article_id);
+        self.extracted_cache
+            .insert(fat_article.article_id.clone(), fat_article);
+
+        while self.extracted_cache.len() > EXTRACTED_CACHE_LIMIT {
+            self.extracted_cache.shift_remove_index(0);
+        }
+    }
+
     pub(super) fn set_fat_article(&mut self, fat_article: FatArticle) {
         self.fat_article = Some(fat_article);
         self.markdown_content = None; // Reset processed content
+        self.content_generation += 1;
+    }
+
+    /// Pixel dimensions of a content image that is ready to be drawn.
+    pub(super) fn content_image_dimensions(&self, url: &str) -> Option<(u32, u32)> {
+        match self.content_images.get(url) {
+            Some(ContentImageState::Loaded { width, height, .. }) => Some((*width, *height)),
+            _ => None,
+        }
+    }
+
+    /// Raw bytes of a loaded content image, kept so that a terminal resize or a revisit only has
+    /// to re-encode rather than re-download.
+    pub(super) fn content_image_data(&self, url: &str) -> Option<&[u8]> {
+        match self.content_images.get(url) {
+            Some(ContentImageState::Loaded { data, .. }) => Some(data),
+            _ => None,
+        }
+    }
+
+    /// Of the URLs the rendered content refers to, those nothing is known about yet.
+    ///
+    /// Anything already `Pending`, `Loaded` or `Unusable` is skipped, which is what stops a
+    /// failing image from being retried on every tick.
+    pub(super) fn pending_content_image_urls(&self, candidates: &[String]) -> Vec<String> {
+        candidates
+            .iter()
+            .filter(|url| !self.content_images.contains_key(url.as_str()))
+            .take(CONTENT_IMAGE_BATCH_LIMIT)
+            .cloned()
+            .collect()
+    }
+
+    /// Whether the debounce for content image downloads has elapsed, so that quickly browsing
+    /// through articles does not start a batch for each one.
+    pub(super) fn content_image_debounce_elapsed(&self, config: &Config) -> bool {
+        match self.instant_since_article_selected {
+            Some(selected) => {
+                selected.elapsed() >= Duration::from_millis(config.content_image_debounce_millis)
+            }
+            None => true,
+        }
+    }
+
+    pub(super) fn start_fetch_content_images(
+        &mut self,
+        urls: Vec<String>,
+        base_url: Option<String>,
+    ) {
+        let Some(article_id) = self
+            .article
+            .as_ref()
+            .map(|article| article.article_id.clone())
+        else {
+            return;
+        };
+
+        // Marking them pending up front keeps the next tick from selecting the same URLs again.
+        for url in &urls {
+            self.insert_content_image(url.clone(), ContentImageState::Pending);
+        }
+
+        self.content_image_fetch_running = true;
+        self.image_fetch_abort = Some(
+            self.news_flash_utils
+                .fetch_content_images(article_id, base_url, urls),
+        );
+    }
+
+    pub(super) fn on_content_image_finished(&mut self, image: &ContentImage) {
+        // The user may have moved on while the batch was in flight.
+        if self.article.as_ref().map(|article| &article.article_id) != Some(&image.article_id) {
+            return;
+        }
+
+        let state = match image.data.as_ref() {
+            Some(data)
+                if image.width >= CONTENT_IMAGE_MIN_PIXELS
+                    && image.height >= CONTENT_IMAGE_MIN_PIXELS =>
+            {
+                ContentImageState::Loaded {
+                    data: data.clone(),
+                    width: image.width,
+                    height: image.height,
+                }
+            }
+            _ => ContentImageState::Unusable,
+        };
+
+        self.insert_content_image(image.url.clone(), state);
+        self.content_generation += 1;
+    }
+
+    pub(super) fn on_content_images_finished(&mut self, article_id: &ArticleID) {
+        if self.article.as_ref().map(|article| &article.article_id) != Some(article_id) {
+            return;
+        }
+
+        self.content_image_fetch_running = false;
+        self.image_fetch_abort = None;
+    }
+
+    /// Cancel an in-flight batch and forget the URLs it had claimed, so that they can be picked up
+    /// again by whichever article references them next.
+    pub(super) fn abort_content_image_fetch(&mut self) {
+        if let Some(abort) = self.image_fetch_abort.take() {
+            abort.abort();
+        }
+        self.content_image_fetch_running = false;
+
+        let pending = self
+            .content_images
+            .iter()
+            .filter(|(_, state)| matches!(state, ContentImageState::Pending))
+            .map(|(url, _)| url.clone())
+            .collect::<Vec<String>>();
+
+        for url in pending {
+            self.content_images.shift_remove(&url);
+        }
+    }
+
+    fn insert_content_image(&mut self, url: String, state: ContentImageState) {
+        self.content_image_bytes += state.byte_len();
+        if let Some((_, evicted)) = self.content_images.shift_remove_entry(&url) {
+            self.content_image_bytes = self.content_image_bytes.saturating_sub(evicted.byte_len());
+        }
+        self.content_images.insert(url, state);
+
+        while self.content_images.len() > CONTENT_IMAGE_CACHE_LIMIT
+            || self.content_image_bytes > CONTENT_IMAGE_CACHE_BYTES
+        {
+            let Some((_, evicted)) = self.content_images.shift_remove_index(0) else {
+                break;
+            };
+            self.content_image_bytes = self.content_image_bytes.saturating_sub(evicted.byte_len());
+        }
     }
 
     pub(super) fn get_or_create_markdown_content(
@@ -398,5 +704,6 @@ Process returned with error ({})
         }
 
         self.filtered_markdown_content.replace(markdown_content);
+        self.content_generation += 1;
     }
 }

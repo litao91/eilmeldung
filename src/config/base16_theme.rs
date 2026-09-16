@@ -220,11 +220,20 @@ pub enum Base16Index {
     Base07,
     Base08,
     Base09,
+    // The canonical base16 spelling keeps the hex letters upper case, as do the bundled schemes in
+    // `assets/base16-schemes`, the `Base16Palette` fields and `docs/configuration.md`;
+    // `rename_all = "lowercase"` alone would ask for `base0a` instead.
+    #[serde(rename = "base0A")]
     Base0A,
+    #[serde(rename = "base0B")]
     Base0B,
+    #[serde(rename = "base0C")]
     Base0C,
+    #[serde(rename = "base0D")]
     Base0D,
+    #[serde(rename = "base0E")]
     Base0E,
+    #[serde(rename = "base0F")]
     Base0F,
 }
 

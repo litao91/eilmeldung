@@ -1,10 +1,11 @@
 use crate::{messages::event::AsyncOperationError, prelude::*};
 use std::{
-    collections::HashMap, error::Error, hash::Hash, path::Path, process::Stdio, str::FromStr,
-    sync::Arc, time::Duration,
+    collections::HashMap, error::Error, hash::Hash, io::Cursor, path::Path, process::Stdio,
+    str::FromStr, sync::Arc, time::Duration,
 };
 
 use htmd::HtmlToMarkdown;
+use image::ImageReader;
 use news_flash::{
     NewsFlash,
     error::NewsFlashError,
@@ -93,6 +94,145 @@ pub fn build_client(timeout: Duration) -> color_eyre::Result<Client> {
         .timeout(timeout);
 
     Ok(builder.build()?)
+}
+
+/// Extract the readable article body out of a fetched page.
+///
+/// Kept separate from the async fetch so that it can be tested without a network. The returned
+/// `content` is cleaned article HTML with absolute image URLs, ready for the existing
+/// HTML → markdown → renderer chain; `text_content` feeds the plain-text path.
+fn extract_article(
+    article_id: ArticleID,
+    url: &str,
+    html: &str,
+) -> Result<ExtractedArticle, AsyncOperationError> {
+    let extracted = libreadability::extract(html, Some(url)).map_err(|error| {
+        AsyncOperationError::Report(color_eyre::eyre::eyre!(
+            "could not extract readable content from {url}: {error}"
+        ))
+    })?;
+
+    // Readability can report success while finding nothing worth reading; fail so that the caller
+    // falls back to news-flash's scraper instead of showing an empty article.
+    if extracted.length == 0 {
+        return Err(AsyncOperationError::Report(color_eyre::eyre::eyre!(
+            "no readable content could be extracted from {url}"
+        )));
+    }
+
+    Ok(ExtractedArticle {
+        article_id,
+        content: extracted.content,
+        text_content: extracted.text_content,
+        title: Some(extracted.title).filter(|title| !title.trim().is_empty()),
+        byline: Some(extracted.byline).filter(|byline| !byline.trim().is_empty()),
+    })
+}
+
+/// Largest content image that will be downloaded.
+const CONTENT_IMAGE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// How many content images are downloaded concurrently.
+const CONTENT_IMAGE_CONCURRENCY: usize = 3;
+
+/// Resolve a possibly-relative image reference against the article's page URL.
+///
+/// `libreadability` already absolutizes the URLs it returns, but content from news-flash's
+/// scraper or from a user-defined pipe may not be. Only `http`/`https` are supported, which
+/// deliberately excludes `data:` URIs.
+fn resolve_image_url(base_url: Option<&str>, url: &str) -> color_eyre::Result<::url::Url> {
+    let absolute = match ::url::Url::parse(url) {
+        Ok(absolute) => absolute,
+        Err(::url::ParseError::RelativeUrlWithoutBase) => {
+            let base = base_url.ok_or_else(|| {
+                color_eyre::eyre::eyre!("{url} is relative but no base URL is known")
+            })?;
+            ::url::Url::parse(base)?.join(url)?
+        }
+        Err(error) => return Err(color_eyre::eyre::eyre!("{url} is not a valid URL: {error}")),
+    };
+
+    if absolute.scheme() != "http" && absolute.scheme() != "https" {
+        return Err(color_eyre::eyre::eyre!(
+            "unsupported URL scheme `{}`",
+            absolute.scheme()
+        ));
+    }
+
+    Ok(absolute)
+}
+
+/// Download one content image and read its pixel dimensions.
+///
+/// Never fails: a problem is logged and reported as `data: None`, so that one broken image cannot
+/// abort the rest of the batch. Only the image header is parsed here; the full decode happens when
+/// the terminal image protocol is built.
+async fn download_content_image(
+    client: &Client,
+    article_id: &ArticleID,
+    base_url: Option<&str>,
+    url: &str,
+) -> ContentImage {
+    let downloaded = async {
+        let absolute = resolve_image_url(base_url, url)?;
+
+        let response = client
+            .get(absolute)
+            .send()
+            .await
+            .map_err(|error| color_eyre::eyre::eyre!("request for {url} failed: {error}"))?;
+
+        if !response.status().is_success() {
+            return Err(color_eyre::eyre::eyre!(
+                "{url} returned HTTP status {}",
+                response.status()
+            ));
+        }
+
+        if let Some(length) = response.content_length()
+            && length > CONTENT_IMAGE_MAX_BYTES
+        {
+            return Err(color_eyre::eyre::eyre!(
+                "{url} is {length} bytes, over the limit of {CONTENT_IMAGE_MAX_BYTES}"
+            ));
+        }
+
+        let data = response.bytes().await.map_err(|error| {
+            color_eyre::eyre::eyre!("could not read the body of {url}: {error}")
+        })?;
+
+        if data.len() as u64 > CONTENT_IMAGE_MAX_BYTES {
+            return Err(color_eyre::eyre::eyre!(
+                "{url} is {} bytes, over the limit of {CONTENT_IMAGE_MAX_BYTES}",
+                data.len()
+            ));
+        }
+
+        let (width, height) = ImageReader::new(Cursor::new(data.as_ref()))
+            .with_guessed_format()
+            .map_err(|error| color_eyre::eyre::eyre!("{url} has an unreadable format: {error}"))?
+            .into_dimensions()
+            .map_err(|error| color_eyre::eyre::eyre!("could not size {url}: {error}"))?;
+
+        Ok::<(Vec<u8>, u32, u32), color_eyre::Report>((data.to_vec(), width, height))
+    }
+    .await;
+
+    let (data, width, height) = match downloaded {
+        Ok(downloaded) => (Some(downloaded.0), downloaded.1, downloaded.2),
+        Err(error) => {
+            log::debug!("not displaying content image {url}: {error}");
+            (None, 0, 0)
+        }
+    };
+
+    ContentImage {
+        article_id: article_id.clone(),
+        url: url.to_owned(),
+        data,
+        width,
+        height,
+    }
 }
 
 #[rustfmt::skip]        
@@ -607,6 +747,131 @@ impl NewsFlashUtils {
 
     }
 
+    /// Fetch an article's page with the built-in HTTP client and extract its body with
+    /// `libreadability`.
+    ///
+    /// This is the `ContentFetcher::Readability` counterpart of `fetch_fat_article`: it replaces
+    /// news-flash's own scraper rather than wrapping it. Deliberately hand-written instead of
+    /// using `gen_async_call!` because it needs an HTTP round-trip plus a blocking extraction
+    /// step, not a single news-flash call. It still takes `async_operation_mutex` so that the
+    /// status bar throbber behaves exactly as it does for a news-flash scrape.
+    pub fn fetch_article_html(&self, article_id: ArticleID, url: String) {
+        let client_lock = self.client_lock.clone();
+        let command_sender = self.command_sender.clone();
+        let async_operation_mutex = self.async_operation_mutex.clone();
+
+        tokio::spawn(async move {
+            let _lock = async_operation_mutex.lock().await;
+
+            if let Err(e) = async {
+                command_sender
+                    .send(Message::Event(Event::AsyncArticleExtract))
+                    .map_err(|send_error| color_eyre::eyre::eyre!(send_error))?;
+
+                let (status, html) = {
+                    let client = client_lock.read().await;
+                    let response = client.get(url.as_str()).send().await.map_err(|e| {
+                        AsyncOperationError::Report(color_eyre::eyre::eyre!(
+                            "could not fetch {url}: {e}"
+                        ))
+                    })?;
+                    let status = response.status();
+                    let html = response.text().await.map_err(|e| {
+                        AsyncOperationError::Report(color_eyre::eyre::eyre!(
+                            "could not read response body of {url}: {e}"
+                        ))
+                    })?;
+                    (status, html)
+                };
+
+                if !status.is_success() {
+                    return Err(AsyncOperationError::Report(color_eyre::eyre::eyre!(
+                        "{url} returned HTTP status {status}"
+                    )));
+                }
+
+                // Extraction walks the whole DOM and is CPU-bound, so keep it off the async
+                // worker; the client lock is already released at this point.
+                let page_url = url.clone();
+                let extracted =
+                    tokio::task::spawn_blocking(move || extract_article(article_id, &page_url, &html))
+                        .await
+                        .map_err(|e| {
+                            AsyncOperationError::Report(color_eyre::eyre::eyre!(
+                                "extraction task for {url} failed: {e}"
+                            ))
+                        })??;
+
+                command_sender
+                    .send(Message::Event(Event::AsyncArticleExtractFinished(extracted)))
+                    .map_err(|send_error| color_eyre::eyre::eyre!(send_error))?;
+
+                Ok::<(), AsyncOperationError>(())
+            }
+            .await
+            {
+                error!("Async call fetch_article_html failed: {e}");
+                let _ = command_sender.send(Message::Event(Event::AsyncOperationFailed(
+                    e,
+                    Box::new(Event::AsyncArticleExtract),
+                )));
+            }
+        });
+    }
+
+    /// Download the images referred to by an article's content so they can be drawn inline.
+    ///
+    /// Deliberately does *not* take `async_operation_mutex` the way every `gen_async_call!`
+    /// operation does: that mutex serialises all async work, so a batch of image downloads would
+    /// block syncing and keep the status bar throbber spinning for its whole duration. Images are
+    /// decoration rather than a user-visible operation, and each one is reported individually as
+    /// it lands so that they can appear progressively.
+    ///
+    /// Returns an `AbortHandle` so the caller can cancel the batch when the user moves on to
+    /// another article.
+    pub fn fetch_content_images(
+        &self,
+        article_id: ArticleID,
+        base_url: Option<String>,
+        urls: Vec<String>,
+    ) -> tokio::task::AbortHandle {
+        let client_lock = self.client_lock.clone();
+        let command_sender = self.command_sender.clone();
+
+        tokio::spawn(async move {
+            // Clone the client and release the lock straight away so that a slow batch cannot
+            // block `rebuild_client`.
+            let client = client_lock.read().await.clone();
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(CONTENT_IMAGE_CONCURRENCY));
+
+            let downloads = urls.into_iter().map(|url| {
+                let client = client.clone();
+                let semaphore = Arc::clone(&semaphore);
+                let article_id = article_id.clone();
+                let base_url = base_url.clone();
+                let command_sender = command_sender.clone();
+
+                async move {
+                    let Ok(_permit) = semaphore.acquire().await else {
+                        return;
+                    };
+
+                    let image =
+                        download_content_image(&client, &article_id, base_url.as_deref(), &url).await;
+
+                    let _ = command_sender
+                        .send(Message::Event(Event::AsyncContentImageFetchFinished(image)));
+                }
+            });
+
+            futures::future::join_all(downloads).await;
+
+            let _ = command_sender
+                .send(Message::Event(Event::AsyncContentImagesFetchFinished(article_id)));
+        })
+        .abort_handle()
+    }
+
     pub async fn undo_last_operation(&self) -> Option<UndoOperation> {
 
         let last_operation = {
@@ -906,4 +1171,153 @@ pub fn sort_feeds_and_categories(
                 .cmp(&feed_mapping_for_f2.map(|feed_mapping| feed_mapping.sort_index)),
         )
     });
+}
+
+#[cfg(test)]
+mod extract_article_test {
+    use super::*;
+
+    const PAGE_URL: &str = "https://example.com/news/story";
+
+    /// A realistic news page: article body surrounded by navigation, ads, a teaser sidebar,
+    /// a footer, inline styles and tracking scripts.
+    const ARTICLE_PAGE: &str = r#"<!DOCTYPE html>
+<html lang="en"><head><title>Site Name - Article Title</title>
+<style>body{font-family:sans-serif}.ad{background:#eee}</style>
+<script>window.tracking = {id: 42};</script></head>
+<body>
+<header><nav><a href="/">Home</a><a href="/world">World</a><a href="/tech">Tech</a>
+<form action="/search"><input name="q"><button>Search</button></form></nav></header>
+<div class="ad">ADVERTISEMENT - buy things now</div>
+<article>
+  <h1>The Real Article Headline</h1>
+  <p class="byline">By Jane Reporter</p>
+  <p>First paragraph of the actual story, which needs to be long enough that the
+     readability scoring algorithm considers this container to be the dominant
+     text block on the page rather than the navigation or the sidebar.</p>
+  <figure><img src="/media/photo-1234.jpg" alt="A protester holds a sign">
+    <figcaption>Protesters gathered outside the ministry. Photograph: AP</figcaption></figure>
+  <p>Second paragraph continues the story with more detail about what happened
+     and who was involved, adding enough weight for the extraction to lock on.</p>
+  <blockquote><p>A quote from an official who spoke on condition of anonymity.</p></blockquote>
+  <p>Third paragraph wraps up the reporting and points to what happens next in
+     the coming weeks, according to people familiar with the matter.</p>
+  <img src="https://cdn.example.com/inline-chart.png" alt="Chart of results">
+  <p>Final paragraph of the story proper.</p>
+</article>
+<aside><h2>Related articles</h2><ul><li><a href="/a">Teaser one</a></li>
+<li><a href="/b">Teaser two</a></li><li><a href="/c">Teaser three</a></li></ul></aside>
+<div class="ad">MORE ADVERTISEMENTS</div>
+<footer><p>Copyright 2026 Site Name</p><nav><a href="/privacy">Privacy</a>
+<a href="/terms">Terms</a></nav></footer>
+<script>console.log("analytics");</script>
+</body></html>"#;
+
+    fn extract(html: &str) -> Result<ExtractedArticle, AsyncOperationError> {
+        extract_article(ArticleID::new("article-1"), PAGE_URL, html)
+    }
+
+    #[test]
+    fn extracts_the_story_and_drops_site_chrome() {
+        let extracted = extract(ARTICLE_PAGE).expect("extraction succeeds");
+
+        assert!(
+            extracted
+                .content
+                .contains("First paragraph of the actual story")
+        );
+        assert!(
+            extracted
+                .content
+                .contains("Final paragraph of the story proper")
+        );
+
+        for chrome in [
+            "ADVERTISEMENT",
+            "Teaser one",
+            "Copyright 2026",
+            "window.tracking",
+            "console.log",
+            "font-family",
+            "<nav",
+            "<form",
+            "<aside",
+            "<script",
+            "<style",
+        ] {
+            assert!(
+                !extracted.content.contains(chrome),
+                "{chrome:?} should have been stripped, content was {}",
+                extracted.content
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_images_and_makes_their_urls_absolute() {
+        let extracted = extract(ARTICLE_PAGE).expect("extraction succeeds");
+
+        // Two images in the body: one relative, one already absolute.
+        assert_eq!(2, extracted.content.matches("<img").count());
+        assert!(
+            extracted
+                .content
+                .contains("https://example.com/media/photo-1234.jpg"),
+            "relative src should be resolved against the page URL, content was {}",
+            extracted.content
+        );
+        assert!(
+            extracted
+                .content
+                .contains("https://cdn.example.com/inline-chart.png")
+        );
+        assert!(
+            extracted
+                .content
+                .contains(r#"alt="A protester holds a sign""#)
+        );
+    }
+
+    #[test]
+    fn extracts_byline_and_plain_text() {
+        let extracted = extract(ARTICLE_PAGE).expect("extraction succeeds");
+
+        assert_eq!(Some("By Jane Reporter".to_owned()), extracted.byline);
+        assert!(
+            extracted
+                .text_content
+                .contains("First paragraph of the actual story")
+        );
+        assert!(
+            !extracted.text_content.contains('<'),
+            "plain text had markup"
+        );
+        assert_eq!(ArticleID::new("article-1"), extracted.article_id);
+    }
+
+    /// A page whose body is built client-side yields nothing over plain HTTP. Extraction must
+    /// fail rather than show an empty article, so that the caller falls back to news-flash.
+    #[test]
+    fn fails_on_a_client_side_rendered_shell() {
+        let shell = r#"<html><head><title>Empty</title></head><body><div id="app"></div>
+<script>renderApp();</script></body></html>"#;
+
+        claims::assert_matches!(extract(shell), Err(_));
+    }
+
+    /// Readability discards a gallery with no accompanying text. Failing here hands the article
+    /// to news-flash's scraper, which may do better.
+    #[test]
+    fn fails_when_nothing_readable_is_found() {
+        let gallery = r#"<html><head><title>Gallery</title></head><body>
+<div id="content"><img src="https://cdn.example.com/1.jpg" alt="One">
+<img src="https://cdn.example.com/2.jpg" alt="Two"></div></body></html>"#;
+
+        claims::assert_matches!(extract(gallery), Err(_));
+    }
+
+    #[test]
+    fn fails_on_unparseable_input() {
+        claims::assert_matches!(extract(""), Err(_));
+    }
 }

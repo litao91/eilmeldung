@@ -1,5 +1,20 @@
 # Unreleased
 
+- feature: **inline images in the article content**
+  - images within the body of an article are now downloaded and drawn directly in the terminal, at the position they occupy in the text and scaled to their aspect ratio; see *Inline Images* in `docs/configuration.md`
+  - this needs a terminal with a graphics protocol (*kitty*, *iTerm2*, *sixel*); on other terminals half-block characters are used instead
+  - new option `content_show_images` (default `true`) switches this off; `content_image_max_height` (default `12`) caps how many rows an image may occupy, and `content_image_debounce_millis` (default `500`) delays downloading so that browsing quickly does not fetch every article's images
+  - images that cannot be downloaded, along with icons and tracking pixels, remain *hints* as before
+- feature: selectable content extractor
+  - new option `content_fetcher` (default `"readability"`) chooses how the full content of an article is extracted
+  - `"readability"` fetches the page with eilmeldung's own HTTP client and extracts the body with [libreadability](https://crates.io/crates/libreadability), a port of Mozilla's Readability algorithm; `"newsflash"` keeps using news-flash's own scraper
+  - when extraction fails, eilmeldung falls back to news-flash's scraper and says so once in the status bar
+  - note that neither extractor executes JavaScript, so a page that builds its body client-side may still come back empty
+- bugfix: the position indicator of the article content (bottom right) no longer overflows once an article is scrolled past roughly 655 rows
+- bugfixes in `examples/default-config.toml` and the custom base16 theme support
+  - the second `[theme.base16_dark]` table was meant to be `[theme.base16_light]`; the duplicate key made the whole example file fail to parse
+  - `base16_dark`/`base16_light` mappings now accept the canonical spellings `base0A` … `base0F`; previously only the lower-case `base0a` … `base0f` were recognised, which contradicted `docs/configuration.md`, the schemes in `assets/base16-schemes` and the palette itself
+  - a test now deserializes `examples/default-config.toml` so that neither can drift again
 - feature: custom base16 themes in `config.toml`
   - you can now directly configure custom base16 themes within the *eilmeldung* configuration file `config.toml`; see *Custom Base16 Themes* in `docs/configuration.md`.
   - this also works if you configure *eilmeldung* through home-manager

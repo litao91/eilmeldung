@@ -51,6 +51,10 @@ thumbnail_resize = true
 thumbnail_fetch_debounce_millis = 500
 text_max_width = 66
 content_preferred_type = "markdown"
+content_fetcher = "readability"
+content_show_images = true
+content_image_max_height = 12
+content_image_debounce_millis = 500
 
 # Layout
 # show_top_bar = true # deprecated, will be removed in future versions
@@ -328,7 +332,7 @@ info = "base0B"
 warning = "base0A"
 error = "base08"
 
-[theme.base16_dark]
+[theme.base16_light]
 background = "base00"
 foreground = "base07"
 muted = "base03"
