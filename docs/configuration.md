@@ -143,13 +143,14 @@ Afterwards, auto-reloading should work.
 | `text_max_width`                  | integer               | Maximum text width for article content                                                                                                                             |
 | `content_preferred_type`          | string                | Preferred content type: `"plain_text"` or `"markdown"`                                                                                                             |
 | `content_fetcher`                 | string                | Which extractor fetches the full article content: `"readability"` or `"newsflash"`                                                                                 |
-| `content_show_images`             | boolean               | Draw images inside the article content inline rather than as link hints                                                                                            |
+| `content_show_images`             | boolean               | Show an article's images inline from the start; `p` toggles them                                                                                                   |
 | `content_image_max_height`        | integer               | Maximum number of rows an inline content image may occupy                                                                                                          |
 | `content_image_debounce_millis`   | integer               | Delay before downloading the images of an article (ms)                                                                                                             |
 | `feed_list_focused_width`         | dimension             | Width of feed list when focused                                                                                                                                    |
 | `article_list_focused_width`      | dimension             | Width of article list when focused                                                                                                                                 |
-| `article_list_focused_height`     | dimension             | Height of article list when focused                                                                                                                                |
-| `article_content_focused_height`  | dimension             | Height of article content when focused                                                                                                                             |
+| `article_content_focused_width`   | dimension             | Width of article content when focused                                                                                                                              |
+| `article_list_focused_height`     | dimension             | Deprecated and ignored; the three panels are laid out side by side now                                                                                             |
+| `article_content_focused_height`  | dimension             | Deprecated and ignored; the three panels are laid out side by side now                                                                                             |
 | `enclosure_command`               | string                | Command with which enclosure URLs are opened (see [Opening Enclosures](opening-enclosures))                                                                        |
 | `video_enclosure_command`         | string (optional)     | Command with which video enclosure URLs are opened (see [Opening Enclosures](opening-enclosures))                                                                  |
 | `audio_enclosure_command`         | string (optional)     | Command with which audio enclosure URLs are opened (see [Opening Enclosures](opening-enclosures))                                                                  |
@@ -170,6 +171,9 @@ Afterwards, auto-reloading should work.
 - `{tag_icons}`: Tag icons
 - `{age}`: Article age/date
 - `{title}`: Article title
+- `{summary}`: Up to two lines of the article's summary underneath the title (needs `{title}`; rows grow to three lines, but only if at least one listed article actually has a summary)
+
+With `{summary}` in the list, the `{title}` column also carries the summary and is given three times the share of the leftover width that any other flexible column (`{url}`, `{author}`, `{feed}`) gets. Note that an `article_table` already set in your `config.toml` overrides the default, so `{summary}` has to be added there by hand.
 
 **Dimension:** Is a string:
 - **Percentage**: `"n%"` where `n` is a number from 1 to 100, e.g., `"33%"`, meaning 33% of the available width/height
@@ -862,11 +866,13 @@ Neither extractor executes JavaScript. A page that builds its article body clien
 
 ### Inline Images
 
-With `content_show_images = true` (the default), images inside the article body are downloaded and drawn in the terminal at the position they occupy in the text, scaled to their aspect ratio and limited to `content_image_max_height` rows. Images smaller than 64 pixels in either dimension are treated as icons or tracking pixels and stay link hints.
+Images inside the article body can be downloaded and drawn in the terminal at the position they occupy in the text, scaled to their aspect ratio and limited to `content_image_max_height` rows. Images smaller than 64 pixels in either dimension are treated as icons or tracking pixels and stay link hints.
+
+They are **off** until you ask for them, and asking is per article: press `p` in the article content to toggle its images on and off. Turning them on starts the download; turning them off drops the drawn images but keeps the bytes cached. Moving to another article starts from `content_show_images` again, which is why its default is `false` — set it to `true` if you would rather every article show its images right away, with `p` still available to switch one off.
 
 Drawing images needs a terminal with a graphics protocol: *kitty*, *iTerm2*, or anything supporting *sixel*. Without one, *eilmeldung* falls back to half-block characters, which is legible but coarse.
 
-Downloads start `content_image_debounce_millis` after an article is selected, so that browsing through a list quickly does not fetch every article's images. At most 24 images per article are downloaded, of at most 8 MiB each. The bytes are cached across articles (64 images / 48 MiB), so revisiting an article re-draws them without downloading again.
+Downloads start `content_image_debounce_millis` after the images are asked for, so that holding `p` down or flipping through a list quickly does not fetch every article's images. At most 24 images per article are downloaded, of at most 8 MiB each. The bytes are cached across articles (64 images / 48 MiB), so revisiting an article re-draws them without downloading again.
 
 An image that could not be downloaded stays a link hint, which shifts the hints of the links following it. An image that *is* drawn gets no hint, since there is nothing left to open externally.
 
@@ -875,54 +881,50 @@ Inline images apply to the markdown rendering path, so they need `content_prefer
 
 ## Layout Configuration
 
-You can adjust the layout, that is, the size of the different panels when they are focused and unfocused by the following variables:
+The three panels are laid out side by side, from left to right: feed list, article list, article content. Their widths are set by:
 
 - `feed_list_focused_width`: width of feed list when focused
 - `article_list_focused_width`: width of article list when focused
-- `article_list_focused_height`: height of article list when focused
-- `article_content_focused_height`: height of article content when focused
+- `article_content_focused_width`: width of article content when focused
 
-Each has a *dimension* value which is a string, e.g., `"10 length"` for ten rows/columns or `"33%"` for 33% of the available width/height. For instance, if the feed list should occupy 25% of the total width when focused, set its value to `"25%"` and if you want have 10 articles visible in the article list, set its height value to `"11 length"` (+1 for the header).
+Each has a *dimension* value which is a string, e.g., `"10 length"` for ten columns or `"33%"` for 33% of the available width.
+
+The focused panel gets its configured width, and the other two share what is left **in proportion to their own configured widths**. So if the three widths add up to 100%, the layout looks the same whichever panel is focused; if they add up to more or less than that, the focused panel grows or shrinks relative to the others.
+
+`article_list_focused_height` and `article_content_focused_height` are deprecated and ignored: they sized the vertical split between the article list and the article content, which no longer exists. They are still accepted so that existing configuration files keep loading, and *eilmeldung* warns when they are set.
+
+You can also drag the border between the article list and the article content with the mouse to resize them.
 
 
 ### Example: Static Layout (default)
 
-With the default values, the width/height of each panel is fixed. For example, the feed list is always 25% of the whole width regardless of whether it is focused or not.
+With the default values the three widths add up to 100%, so the layout is the same whichever panel is focused:
 
 ```toml
-feed_list_focused_width = "25%"
-article_list_focused_width = "75%"
-article_list_focused_height = "20%"
-article_content_focused_height = "80%"
+feed_list_focused_width = "20%"
+article_list_focused_width = "30%"
+article_content_focused_width = "50%"
 ```
-
-https://github.com/user-attachments/assets/c4e6e89d-e95e-4a80-b660-5e1b982f6108
 
 ### Example: Dynamic Layout
 
-Here is an example of values, where unfocused panels are smaller to give more space to the focused panel:
+Here the widths add up to more than 100%, so the focused panel is wider and the other two give up space:
 
 ```toml
 feed_list_focused_width = "33%"
-article_list_focused_width = "85%"
-article_list_focused_height = "66%"
-article_content_focused_height = "80%"
+article_list_focused_width = "50%"
+article_content_focused_width = "66%"
 ```
-
-https://github.com/user-attachments/assets/ffc51e67-1842-4b49-a798-6a5d65b04265
 
 ### Example: Fully Dynamic Layout
 
-Here is an example where the feed list completely vanishes when the article list is focused, and the article list completely vanishes when the content is focused:
+Here the two unfocused panels vanish entirely, because the focused panel claims the whole width:
 
 ```toml
-feed_list_focused_width = "33%"
+feed_list_focused_width = "100%"
 article_list_focused_width = "100%"
-article_list_focused_height = "66%"
-article_content_focused_height = "100%"
+article_content_focused_width = "100%"
 ```
-
-https://github.com/user-attachments/assets/e9277d94-a6da-49de-8dd0-8c6a75e09430
 
 ## Automatic Login
 

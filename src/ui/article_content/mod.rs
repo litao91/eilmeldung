@@ -50,7 +50,15 @@ impl ArticleContent {
         &mut self,
         article_id: Option<&ArticleID>,
     ) -> color_eyre::Result<bool> {
-        let article_changed = self.model_data.on_article_selected(article_id).await?;
+        let article_changed = self
+            .model_data
+            .on_article_selected(article_id, &self.config)
+            .await?;
+        // A restored article comes straight from the cache without a fetch, so nothing else
+        // rebuilds its markdown; without this the render falls back to html2text and loses links,
+        // hints and inline images.
+        self.model_data
+            .get_or_create_markdown_content(&self.config)?;
         if self.view_data.rendered_inline_images() {
             // Graphics protocols leave pixels behind that ratatui's cell diffing cannot erase.
             self.message_sender.send(Message::Command(Command::Clear))?;
@@ -122,6 +130,27 @@ impl ArticleContent {
         Ok(())
     }
 
+    /// Show or hide the current article's inline images.
+    ///
+    /// Images are opt-in per article, and turning them on is what starts the downloads — browsing
+    /// the list never fetches an image nobody asked to see.
+    fn toggle_content_images(&mut self) -> color_eyre::Result<()> {
+        let enabled = self.model_data.toggle_content_images();
+        self.view_data.invalidate_layout();
+
+        tooltip(
+            &self.message_sender,
+            if enabled {
+                "showing images of this article"
+            } else {
+                "hiding images of this article"
+            },
+            TooltipFlavor::Info,
+        )?;
+
+        Ok(())
+    }
+
     /// Encode images requested during the last paint and start downloads for images the content
     /// refers to but nothing is known about yet. Returns whether a redraw is worthwhile.
     fn update_content_image_state(&mut self) -> color_eyre::Result<bool> {
@@ -131,7 +160,7 @@ impl ArticleContent {
     }
 
     fn start_content_image_fetch(&mut self) -> bool {
-        if !self.config.content_show_images
+        if !*self.model_data.content_images_enabled()
             || *self.model_data.content_image_fetch_running()
             || !self.model_data.content_image_debounce_elapsed(&self.config)
         {
@@ -411,6 +440,10 @@ impl crate::messages::MessageReceiver for ArticleContent {
 
                 C::ArticleCurrentScrape => {
                     self.scrape_article()?;
+                }
+
+                C::ContentToggleImages if handle_command => {
+                    self.toggle_content_images()?;
                 }
 
                 C::ArticleShare(target) => {

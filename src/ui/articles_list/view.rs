@@ -2,15 +2,26 @@ use crate::prelude::*;
 use crate::ui::articles_list::model::ArticleListModelData;
 
 use getset::{Getters, MutGetters};
-use news_flash::models::{ArticleFilter, Marked, Read};
+use news_flash::models::{Article, ArticleFilter, Marked, Read};
 use ratatui::layout::Constraint;
 use ratatui::layout::Rect;
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, Borders, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Table,
     TableState, Widget,
 };
 use strum::IntoEnumIterator;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+/// How many lines a summary may occupy underneath the title.
+const SUMMARY_LINES: usize = 2;
+
+/// Assumed table width before the first render has reported the real one.
+const FALLBACK_TABLE_WIDTH: u16 = 80;
+
+/// Share of the leftover width the title column gets relative to other flexible columns, when it
+/// also carries the two summary lines.
+const TITLE_FLEX_WEIGHT: u16 = 3;
 
 #[derive(Getters, MutGetters)]
 #[getset(get = "pub(super)")]
@@ -139,7 +150,10 @@ impl Widget for &mut ArticlesList {
                 .gen_block(&self.config, &self.filter_state, self.is_focused, area);
         let inner = block.inner(area);
 
-        *self.view_data.article_lines_mut() = Some(area.height.saturating_sub(1));
+        // Taken from `inner` rather than derived from the panel area, so that it stays correct
+        // whichever borders the framing happens to open.
+        *self.view_data.article_lines_mut() = Some(inner.height);
+        *self.view_data.article_width_mut() = Some(inner.width);
 
         StatefulWidget::render(
             &self.view_data.table,
@@ -182,6 +196,18 @@ pub struct ArticleListViewData<'a> {
 
     #[getset(get_mut = "pub(super)", get = "pub(super)")]
     article_lines: Option<u16>,
+
+    /// Width of the table's inner area as of the last render.
+    ///
+    /// Summaries have to be wrapped to the width of the column they land in, which is not known
+    /// until the table has been laid out, so this carries it back to the next [`Self::update`].
+    /// The same one-frame lag already applies to `article_lines`.
+    #[getset(get_mut = "pub(super)")]
+    article_width: Option<u16>,
+
+    /// Height in terminal rows of every article row; more than one when summaries are shown.
+    #[getset(get = "pub(super)")]
+    row_height: u16,
 
     article_count: usize,
 }
@@ -254,55 +280,142 @@ impl<'a> ArticleListViewData<'a> {
         let marked_icon = config.icon_set.marked_icon().to_string();
         let unmarked_icon = config.icon_set.unmarked_icon().to_string();
 
-        let placeholders: Vec<&str> = config
+        let configured: Vec<&str> = config
             .article_table
             .split(",")
             .map(|placeholder| placeholder.trim())
             .collect();
 
-        let mut max_tags: u16 = 0;
+        // `{summary}` is not a column of its own: it adds two lines underneath the title. It only
+        // falls back to being a column when there is no `{title}` to attach it to.
+        let show_summary = configured.contains(&"{summary}");
+        let summary_is_column = show_summary && !configured.contains(&"{title}");
+        let summary_in_title = show_summary && !summary_is_column;
+        let placeholders: Vec<&str> = configured
+            .into_iter()
+            .filter(|placeholder| *placeholder != "{summary}" || summary_is_column)
+            .collect();
+
+        // The tag icon column is sized by the widest tag set, and the summary needs the resulting
+        // column widths to know how far it may run, so both are settled before any row is built.
+        let max_tags = model_data
+            .articles()
+            .iter()
+            .filter_map(|article| model_data.tags_for_article().get(&article.article_id))
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0) as u16;
+
+        let fixed_width = |placeholder: &str| -> Option<u16> {
+            if placeholder == "{read}"
+                || placeholder == "{marked}"
+                || (placeholder == "{flagged}" && !model_data.flagged_articles().is_empty())
+            {
+                Some(2)
+            } else if placeholder == "{flagged}" {
+                Some(0)
+            } else if placeholder == "{age}" {
+                Some(4)
+            } else if placeholder == "{date}" {
+                Some(config.date_format.len() as u16)
+            } else if placeholder == "{tag_icons}" {
+                Some(max_tags)
+            } else {
+                None
+            }
+        };
+
+        // Relative share of the leftover width for a column that has no fixed width. The title
+        // column also carries the two summary lines, so it needs a bigger share than a column
+        // holding a single line; without this a long `{url}` beside it squeezes the summary.
+        let flex_weight = |placeholder: &str| -> u16 {
+            if summary_in_title && placeholder == "{title}" {
+                TITLE_FLEX_WEIGHT
+            } else {
+                1
+            }
+        };
+
+        let summary_width = if show_summary {
+            self.summary_width(
+                &placeholders,
+                &fixed_width,
+                &flex_weight,
+                if summary_in_title {
+                    "{title}"
+                } else {
+                    "{summary}"
+                },
+            )
+        } else {
+            0
+        };
+
+        // Every row gets the same height so that a screen line can be turned back into a row index
+        // by division; walking per-row heights would be needed otherwise. A list in which no
+        // article has a summary keeps the compact single-line rows.
+        let row_height = if summary_width > 0
+            && model_data
+                .articles()
+                .iter()
+                .any(|article| article.title.is_some() && !Self::summary_of(article).is_empty())
+        {
+            SUMMARY_LINES as u16 + 1
+        } else {
+            1
+        };
+        self.row_height = row_height;
+
+        let summary_style = Style::new().add_modifier(Modifier::DIM);
 
         let entries: Vec<Row> = model_data
             .articles()
             .iter()
             .map(|article| {
-                let row_vec: Vec<Line> = placeholders
+                let row_vec: Vec<Text> = placeholders
                     .iter()
                     .map(|placeholder| match *placeholder {
-                        "{title}" => html_sanitize(
-                            article
-                                .title
-                                .as_deref()
-                                .or(article.summary.as_deref())
-                                .unwrap_or("no title and summary"),
-                        )
-                        .into(),
-                        "{tag_icons}" => Line::from(
+                        "{title}" => {
+                            let mut lines = vec![Line::from(html_sanitize(
+                                article
+                                    .title
+                                    .as_deref()
+                                    .or(article.summary.as_deref())
+                                    .unwrap_or("no title and summary"),
+                            ))];
+                            // The title falls back to the summary when an article has none, so
+                            // showing the summary underneath as well would repeat it.
+                            if show_summary && !summary_is_column && article.title.is_some() {
+                                lines.extend(Self::summary_lines(
+                                    article,
+                                    summary_width,
+                                    summary_style,
+                                ));
+                            }
+                            Text::from(lines)
+                        }
+                        "{summary}" => {
+                            Text::from(Self::summary_lines(article, summary_width, summary_style))
+                        }
+                        "{tag_icons}" => Text::from(Line::from(
                             match model_data.tags_for_article().get(&article.article_id) {
-                                Some(tag_ids) => {
-                                    max_tags = u16::max(max_tags, tag_ids.len() as u16);
+                                Some(tag_ids) => tag_ids
+                                    .iter()
+                                    .map(|tag_id| {
+                                        let Some(tag) = model_data.tag_map().get(tag_id) else {
+                                            return Span::from("");
+                                        };
 
-                                    tag_ids
-                                        .iter()
-                                        .map(|tag_id| {
-                                            let Some(tag) = model_data.tag_map().get(tag_id) else {
-                                                return Span::from("");
-                                            };
-
-                                            let style = match NewsFlashUtils::tag_color(tag) {
-                                                Some(color) => config.theme.tag().fg(color),
-                                                None => config.theme.tag(),
-                                            };
-                                            Span::styled(
-                                                config.icon_set.tag_icon().to_string(),
-                                                style,
-                                            )
-                                        })
-                                        .collect::<Vec<Span>>()
-                                }
+                                        let style = match NewsFlashUtils::tag_color(tag) {
+                                            Some(color) => config.theme.tag().fg(color),
+                                            None => config.theme.tag(),
+                                        };
+                                        Span::styled(config.icon_set.tag_icon().to_string(), style)
+                                    })
+                                    .collect::<Vec<Span>>(),
                                 None => vec![Span::from("")],
                             },
-                        ),
+                        )),
                         "{author}" => {
                             html_sanitize(article.author.as_deref().unwrap_or("no author")).into()
                         }
@@ -402,27 +515,15 @@ impl<'a> ArticleListViewData<'a> {
                     style = config.theme.flagged(&style);
                 }
 
-                Row::new(row_vec).style(style)
+                Row::new(row_vec).style(style).height(row_height)
             })
             .collect();
 
-        let constraint_for_placeholder = |placeholder: &str| {
-            if placeholder == "{read}"
-                || placeholder == "{marked}"
-                || (placeholder == "{flagged}" && !model_data.flagged_articles().is_empty())
-            {
-                Constraint::Length(2)
-            } else if placeholder == "{flagged}" {
-                Constraint::Length(0)
-            } else if placeholder == "{age}" {
-                Constraint::Length(4)
-            } else if placeholder == "{date}" {
-                Constraint::Length(config.date_format.len() as u16)
-            } else if placeholder == "{tag_icons}" {
-                Constraint::Length(max_tags)
-            } else {
-                Constraint::Min(1)
-            }
+        let constraint_for_placeholder = |placeholder: &str| match fixed_width(placeholder) {
+            Some(width) => Constraint::Length(width),
+            // `Fill` rather than `Min` so that the shares are proportional to `flex_weight`.
+            None if summary_in_title => Constraint::Fill(flex_weight(placeholder)),
+            None => Constraint::Min(1),
         };
 
         self.scrollbar_state = self
@@ -442,6 +543,92 @@ impl<'a> ArticleListViewData<'a> {
         .row_highlight_style(selected_style);
     }
 
+    /// Width of the column the summary is rendered into.
+    ///
+    /// The table is only laid out when it renders, so this mirrors ratatui's own distribution: the
+    /// fixed-width columns take their length and what is left is shared in proportion to
+    /// `flex_weight`.
+    fn summary_width(
+        &self,
+        placeholders: &[&str],
+        fixed_width: &impl Fn(&str) -> Option<u16>,
+        flex_weight: &impl Fn(&str) -> u16,
+        target: &str,
+    ) -> u16 {
+        let mut used = 0u32;
+        let mut total_weight = 0u32;
+
+        for placeholder in placeholders {
+            match fixed_width(placeholder) {
+                Some(width) => used += u32::from(width),
+                None => total_weight += u32::from(flex_weight(placeholder)),
+            }
+        }
+
+        let remaining =
+            u32::from(self.article_width.unwrap_or(FALLBACK_TABLE_WIDTH)).saturating_sub(used);
+        let share = remaining * u32::from(flex_weight(target)) / total_weight.max(1);
+
+        // One column short so that a wide character or the ellipsis is never clipped at the edge.
+        u16::try_from(share).unwrap_or(u16::MAX).saturating_sub(1)
+    }
+
+    /// The article's summary with markup decoded and all whitespace collapsed onto one line.
+    fn summary_of(article: &Article) -> String {
+        let Some(summary) = article.summary.as_deref() else {
+            return String::new();
+        };
+
+        html_sanitize(summary)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The summary wrapped to at most [`SUMMARY_LINES`] lines, the last one ellipsized if the text
+    /// did not fit.
+    fn summary_lines(article: &Article, width: u16, style: Style) -> Vec<Line<'static>> {
+        let summary = Self::summary_of(article);
+        if summary.is_empty() {
+            return Vec::new();
+        }
+
+        let mut lines = wrap_spans(&[Span::styled(summary, style)], width);
+        if lines.len() <= SUMMARY_LINES {
+            return lines;
+        }
+
+        lines.truncate(SUMMARY_LINES);
+        if let Some(last) = lines.last_mut() {
+            Self::ellipsize(last, style, width);
+        }
+        lines
+    }
+
+    /// Cut a line back to `width` columns, ending it with an ellipsis.
+    fn ellipsize(line: &mut Line<'static>, style: Style, width: u16) {
+        let budget = (width as usize).saturating_sub(UnicodeWidthStr::width("…"));
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+
+        let mut kept = String::new();
+        let mut used = 0usize;
+        for character in text.chars() {
+            let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+            if used + character_width > budget {
+                break;
+            }
+            kept.push(character);
+            used += character_width;
+        }
+        kept.push('…');
+
+        line.spans = vec![Span::styled(kept, style)];
+    }
+
     pub(super) fn gen_block(
         &self,
         config: &Config,
@@ -449,12 +636,9 @@ impl<'a> ArticleListViewData<'a> {
         is_focused: bool,
         area: Rect,
     ) -> (Block<'static>, Rect) {
-        let borders = config
-            .border_theme
-            .framing
-            .eff_borders_open(Borders::BOTTOM);
+        let borders = config.border_theme.framing.eff_borders_open(Borders::RIGHT);
 
-        let enlarged_area = config.border_theme.framing.eff_area(Borders::BOTTOM, area);
+        let enlarged_area = config.border_theme.framing.eff_area(Borders::RIGHT, area);
 
         (
             Block::default()

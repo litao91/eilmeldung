@@ -46,6 +46,7 @@ fn generate_default_input_commands() -> IndexMap<KeySequence, CommandSequence> {
         "C-c"       => "quit",
         "C-r"       => "reloadconfig",
         "x"         => "scrape",
+        "p"         => "images",
         "g f"       => "focus feeds",
         "g a"       => "focus articles",
         "g c"       => "focus content",

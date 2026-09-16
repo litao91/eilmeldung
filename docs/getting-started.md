@@ -79,11 +79,11 @@ Instead of manually adding feeds and categories, you can also import an OPML fil
 
 ## Learning the Interface
 
-eilmeldung has three main panels:
+eilmeldung has three main panels, side by side from left to right:
 
 1. **Feed List** (left): Shows your feeds, categories, tags, and custom queries (this is *customizable*!)
-2. **Article List** (top right): Displays articles from the selected feed/tag/query
-3. **Article Content** (bottom right): Shows the full article content
+2. **Article List** (middle): Displays articles from the selected feed/tag/query
+3. **Article Content** (right): Shows the full article content
 
 ### Basic Navigation
 
@@ -97,6 +97,7 @@ eilmeldung has three main panels:
 - `o`: Open article in browser, mark as read, jump to next unread
 - `; ;`: Open a link hint in an article
 - `x`: Scrape full article content (when preview is truncated)
+- `p`: Show or hide the images of the current article inline
 - `z`: Toggle zen mode (hide everything except article content)
 
 ### Managing Article Status

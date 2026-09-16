@@ -81,6 +81,19 @@ impl Dimension {
             D::Percentage(percent) => Constraint::Percentage(100u16.saturating_sub(*percent)),
         }
     }
+
+    /// Relative weight for sharing the space left over by other panels.
+    ///
+    /// Used for the panels that are *not* focused: they get `Constraint::Fill` with this weight, so
+    /// that a configuration whose three widths add up to 100% lays out identically whichever panel
+    /// is focused, while one that does not grows the focused panel at the others' expense.
+    pub fn as_fill_weight(&self) -> u16 {
+        use Dimension as D;
+        match self {
+            D::Length(length) => (*length).max(1),
+            D::Percentage(percent) => (*percent).max(1),
+        }
+    }
 }
 
 impl<'de> serde::Deserialize<'de> for Dimension {

@@ -214,8 +214,12 @@ pub struct Config {
 
     pub feed_list_focused_width: Dimension,
     pub article_list_focused_width: Dimension,
-    pub article_list_focused_height: Dimension,
-    pub article_content_focused_height: Dimension,
+    pub article_content_focused_width: Dimension,
+
+    // Deprecated: the three panels are laid out side by side now, so there is no vertical split
+    // left to size. Kept as options so that existing configuration files still load.
+    pub article_list_focused_height: Option<Dimension>,
+    pub article_content_focused_height: Option<Dimension>,
 
     pub enclosure_command: String,
     pub video_enclosure_command: Option<String>,
@@ -272,6 +276,8 @@ impl Config {
         self.theme.validate(&config_dir.join("themes/")).await?;
 
         deprecated!(self.show_top_bar);
+        deprecated!(self.article_list_focused_height);
+        deprecated!(self.article_content_focused_height);
         deprecated!(self.scrollbar_begin_symbol);
         deprecated!(self.scrollbar_end_symbol);
         deprecated!(self.scrollbar_track_symbol);
@@ -330,7 +336,7 @@ impl Default for Config {
             tags_label: "{icon} Tags {unread_count}".into(),
             tag_label: "{icon} {label} {unread_count}".into(),
             query_label: "{icon} {label}".into(),
-            article_table: "{flagged},{read},{marked},{tag_icons},{age},{title}".into(),
+            article_table: "{flagged},{read},{marked},{tag_icons},{age},{title},{summary}".into(),
             date_format: "%m/%d %H:%M".into(),
             theme: Default::default(),
             icon_set: Default::default(),
@@ -352,17 +358,18 @@ impl Default for Config {
             text_max_width: 66,
             content_preferred_type: ArticleContentType::Markdown,
             content_fetcher: ContentFetcher::Readability,
-            content_show_images: true,
+            content_show_images: false,
             content_image_max_height: 12,
             content_image_debounce_millis: 500,
             zen_mode_show_header: false,
             content_show_urls: false,
             hint_type: HintType::Letters,
 
-            feed_list_focused_width: Dimension::Percentage(25),
-            article_list_focused_width: Dimension::Percentage(75),
-            article_list_focused_height: Dimension::Percentage(20),
-            article_content_focused_height: Dimension::Percentage(80),
+            feed_list_focused_width: Dimension::Percentage(20),
+            article_list_focused_width: Dimension::Percentage(30),
+            article_content_focused_width: Dimension::Percentage(50),
+            article_list_focused_height: None,
+            article_content_focused_height: None,
 
             default_sort_order: SortOrder::new(vec![SortKey::Date(SortDirection::Ascending)]),
             hide_default_sort_order: true,

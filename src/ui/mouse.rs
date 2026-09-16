@@ -41,13 +41,14 @@ impl PanelAreas {
         }
     }
 
-    /// Returns true if the row is on the horizontal border between the articles list and article content.
-    pub(super) fn is_on_horizontal_border(&self, col: u16, row: u16) -> bool {
-        // The border is at the bottom edge of articles_list / top edge of article_content
-        let border_row = self.articles_list.y + self.articles_list.height;
-        let in_column_range =
-            col >= self.articles_list.x && col < self.articles_list.x + self.articles_list.width;
-        row == border_row && in_column_range
+    /// Returns true if the position is on the vertical border between the articles list and the
+    /// article content.
+    pub(super) fn is_on_vertical_border(&self, col: u16, row: u16) -> bool {
+        // The border is at the right edge of articles_list / left edge of article_content
+        let border_col = self.articles_list.x + self.articles_list.width;
+        let in_row_range =
+            row >= self.articles_list.y && row < self.articles_list.y + self.articles_list.height;
+        col == border_col && in_row_range
     }
 }
 
@@ -69,9 +70,9 @@ impl App {
 
         match mouse_event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                // Check if clicking on the horizontal border to start a drag-resize
+                // Check if clicking on the border to start a drag-resize
                 if !matches!(self.state, AppState::ArticleContentDistractionFree)
-                    && self.panel_areas.is_on_horizontal_border(col, row)
+                    && self.panel_areas.is_on_vertical_border(col, row)
                 {
                     self.drag_resize_active = true;
                     return Ok(());
@@ -106,22 +107,21 @@ impl App {
             }
 
             MouseEventKind::Drag(MouseButton::Left) if self.drag_resize_active => {
-                // Calculate the new articles list height based on drag position
-                let articles_top = self.panel_areas.articles_list().y;
-                let content_bottom = self.panel_areas.article_content().y
-                    + self.panel_areas.article_content().height;
-                let total_height = content_bottom.saturating_sub(articles_top);
-                // Clamp: minimum 3 rows for each panel
-                let new_articles_height = row
-                    .saturating_sub(articles_top)
-                    .clamp(3, total_height.saturating_sub(3));
+                // Calculate the new articles list width based on the drag position
+                let articles_left = self.panel_areas.articles_list().x;
+                let content_right =
+                    self.panel_areas.article_content().x + self.panel_areas.article_content().width;
+                let total_width = content_right.saturating_sub(articles_left);
+                // Clamp: minimum 3 columns for each panel
+                let new_articles_width = col
+                    .saturating_sub(articles_left)
+                    .clamp(3, total_width.saturating_sub(3));
 
-                let old_articles_height =
-                    self.articles_height_override.replace(new_articles_height);
+                let old_articles_width = self.articles_width_override.replace(new_articles_width);
 
-                // only redraw if height has changed
-                if let Some(old_articles_height) = old_articles_height
-                    && old_articles_height != new_articles_height
+                // only redraw if width has changed
+                if let Some(old_articles_width) = old_articles_width
+                    && old_articles_width != new_articles_width
                 {
                     self.message_sender
                         .send(Message::Command(Command::Redraw))?;

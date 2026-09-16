@@ -91,6 +91,12 @@ pub struct ArticleContentModelData {
     /// that its cached layout is stale.
     content_generation: u64,
 
+    /// Whether the current article's images are shown, and therefore downloaded at all.
+    ///
+    /// Per article on purpose: it is reset from `config.content_show_images` on every selection, so
+    /// images stay opt-in per article rather than following you through the whole list.
+    content_images_enabled: bool,
+
     // Processed content
     markdown_content: Option<String>,
 
@@ -123,6 +129,7 @@ impl ArticleContentModelData {
             content_image_fetch_running: false,
             image_fetch_abort: None,
             content_generation: 0,
+            content_images_enabled: false,
             markdown_content: None,
             filtered_markdown_content: None,
             thumbnail_fetch_successful: None,
@@ -137,6 +144,7 @@ impl ArticleContentModelData {
     pub(super) async fn on_article_selected(
         &mut self,
         article_id: Option<&ArticleID>,
+        config: &Config,
     ) -> color_eyre::Result<bool> {
         if self.article.as_ref().map(|article| &article.article_id) == article_id {
             return Ok(false);
@@ -161,6 +169,7 @@ impl ArticleContentModelData {
         self.feed = None;
         self.tags = None;
         self.content_generation += 1;
+        self.content_images_enabled = config.content_show_images;
 
         match article_id {
             Some(article_id) => {
@@ -350,12 +359,30 @@ impl ArticleContentModelData {
         self.content_generation += 1;
     }
 
-    /// Pixel dimensions of a content image that is ready to be drawn.
-    pub(super) fn content_image_dimensions(&self, url: &str) -> Option<(u32, u32)> {
-        match self.content_images.get(url) {
-            Some(ContentImageState::Loaded { width, height, .. }) => Some((*width, *height)),
-            _ => None,
-        }
+    /// Flip whether the current article's images are shown, returning the new state.
+    ///
+    /// Turning them on is also what starts the downloads: nothing is fetched for an article whose
+    /// images were never asked for.
+    pub(super) fn toggle_content_images(&mut self) -> bool {
+        self.content_images_enabled = !self.content_images_enabled;
+        self.content_images_enabled
+    }
+
+    /// Every content image that is ready to be drawn, with its pixel dimensions.
+    ///
+    /// The view snapshots this before rendering markdown so that the image hook can tell a
+    /// drawable image from one that still has to fall back to a hint link. Snapshotting the whole
+    /// set rather than only the URLs seen last time is what makes a cached article draw its images
+    /// on the very first layout pass after being revisited.
+    pub(super) fn loaded_content_images(&self) -> impl Iterator<Item = (&str, u32, u32)> {
+        self.content_images
+            .iter()
+            .filter_map(|(url, state)| match state {
+                ContentImageState::Loaded { width, height, .. } => {
+                    Some((url.as_str(), *width, *height))
+                }
+                ContentImageState::Pending | ContentImageState::Unusable => None,
+            })
     }
 
     /// Raw bytes of a loaded content image, kept so that a terminal resize or a revisit only has

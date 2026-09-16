@@ -1,3 +1,5 @@
+pub mod text_wrap;
+
 use ratatui::{
     style::Style,
     text::{Line, Span, Text},
@@ -11,6 +13,7 @@ pub mod prelude {
     pub use super::lex_ordering;
     pub use super::patch_text_style;
     pub use super::prepare_command;
+    pub use super::text_wrap::wrap_spans;
     pub use super::to_bubble;
 }
 
@@ -18,7 +21,10 @@ pub fn html_sanitize(html_escaped_string: &str) -> String {
     let wide_amp_replaced = html_escaped_string.replace("\u{FF06}", "&"); // sometimes &xyz; gets encoded as \u{FF06}xyz; (FF06 is wide ampersand)
     htmlescape::decode_html(&wide_amp_replaced)
         .inspect_err(|error| {
-            log::warn!(
+            // Routine rather than exceptional: a bare "&" ("AT&T", "Arts & Sciences") is not a
+            // valid entity, so decoding fails and the original string is used unchanged, which is
+            // the right result. Article summaries are full of them.
+            log::debug!(
                 "string could not be html-decoded: {error:?}, string was {wide_amp_replaced}, original string was {html_escaped_string}"
             )
         })

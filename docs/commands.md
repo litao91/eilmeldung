@@ -204,6 +204,7 @@ These commands support a **scope parameter** to target specific articles:
 | `hintfollow`    | `hintfollow <hint>`          | Article Content               | Open the hint in the web browser. Example: `hintfollow f` opens the URL with hint `f`                                                                                                                               |
 | `hintshare`     | `hintshare <target> <hint>`  | Article Content               | Shares the URL to which the hint points with the given target, e.g., `hintshare clipboard h` copies the URL with hint `h` to the clipboard                                                                          |
 | `pipe`          | `pipe <in> <out> <command>`  | Article Content               | Pipes the content of the article (type defined by `in`) through the given shell command and displays the output (type defined by `out`); see also [here](pipe.md) |
+| `images`        | `images`                     | Article Content               | Shows or hides the images of the current article inline in its text; they are downloaded only once shown (see also configuration option `content_show_images`)                                                      |
 
 
 **Note:** By default, the commands `show`, `read` and `unread` are executed in the currently focused panel (feeds or articles). If you want to execute the command in a specific panel, use the `in` meta command, e.g., `in articles read %`, `in feeds show all`, etc.

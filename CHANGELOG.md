@@ -1,9 +1,21 @@
 # Unreleased
 
+- **Breaking Change**: the three panels are now laid out **side by side** — feed list, article list, article content from left to right — instead of the article list sitting above the article content
+  - new option `article_content_focused_width` (default `"50%"`); the defaults are now `feed_list_focused_width = "20%"`, `article_list_focused_width = "30%"` (was `"75%"`) and `article_content_focused_width = "50%"`, so that the three add up to 100% and the layout is the same whichever panel is focused
+  - `article_list_focused_height` and `article_content_focused_height` are deprecated and ignored, since there is no vertical split left to size; they are still accepted so that existing configuration files keep loading, and a warning is logged when they are set
+  - the border between the article list and the article content can still be dragged to resize them, now horizontally
+  - see *Layout Configuration* in `docs/configuration.md`
+- feature: short summaries in the article list
+  - new `{summary}` placeholder for `article_table` (included in the default) renders up to two lines of the article's summary underneath its title, dimmed and ellipsized when it does not fit
+  - note that an `article_table` already set in your `config.toml` overrides the default, so add `{summary}` to it yourself to see summaries
+  - the `{title}` column now carries the summary too, so it is given three times the share of the leftover width of any other flexible column (`{url}`, `{author}`, `{feed}`); without that, a long `{url}` beside it squeezes the summary to a few characters per line
+  - rows grow to three lines, but only when at least one of the listed articles actually has a summary, so feeds without summaries are unaffected
+  - remove `{summary}` from `article_table` to get the previous single-line rows back
 - feature: **inline images in the article content**
-  - images within the body of an article are now downloaded and drawn directly in the terminal, at the position they occupy in the text and scaled to their aspect ratio; see *Inline Images* in `docs/configuration.md`
+  - images within the body of an article can now be downloaded and drawn directly in the terminal, at the position they occupy in the text and scaled to their aspect ratio; see *Inline Images* in `docs/configuration.md`
   - this needs a terminal with a graphics protocol (*kitty*, *iTerm2*, *sixel*); on other terminals half-block characters are used instead
-  - new option `content_show_images` (default `true`) switches this off; `content_image_max_height` (default `12`) caps how many rows an image may occupy, and `content_image_debounce_millis` (default `500`) delays downloading so that browsing quickly does not fetch every article's images
+  - they are off by default and switched on **per article** with the new `images` command, bound to `p` in the article content; images are only downloaded once asked for, so browsing never pays for them
+  - new option `content_show_images` (default `false`) makes every article start with its images shown; `content_image_max_height` (default `12`) caps how many rows an image may occupy, and `content_image_debounce_millis` (default `500`) delays downloading after the toggle
   - images that cannot be downloaded, along with icons and tracking pixels, remain *hints* as before
 - feature: selectable content extractor
   - new option `content_fetcher` (default `"readability"`) chooses how the full content of an article is extracted

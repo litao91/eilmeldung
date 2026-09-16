@@ -584,6 +584,13 @@ pub enum Command {
     )]
     ArticleCurrentScrape,
 
+    #[strum(
+        serialize = "images",
+        message = "images",
+        detailed_message = "show/hide inline images of the current article (article content)"
+    )]
+    ContentToggleImages,
+
     // article list searching
     #[strum(
         serialize = "searcharticles",
@@ -878,6 +885,7 @@ impl Display for Command {
             }
 
             ArticleCurrentScrape => write!(f, "scrape content"),
+            ContentToggleImages => write!(f, "toggle inline images"),
 
             ImportOpml(path) => write!(f, "import OPML file from {path}"),
             ExportOpml(path) => write!(f, "export OPML file to {path}"),

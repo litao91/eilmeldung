@@ -197,23 +197,41 @@ impl ArticlesList {
         }
     }
 
+    /// How many article rows fit in the panel, as of the last render.
+    ///
+    /// A row spans several screen lines once summaries are shown, so the line count the panel
+    /// reports has to be converted before it can be used as a row count.
+    fn visible_rows(&self) -> Option<u16> {
+        let row_height = (*self.view_data.row_height()).max(1);
+        self.view_data
+            .article_lines()
+            .map(|lines| lines / row_height)
+    }
+
     fn adjust_offset(&mut self) {
         let Some(index) = self.view_data.get_table_state_mut().selected() else {
             return;
         };
 
-        let scrollbar_state = self.view_data.scrollbar_state_mut();
-        *scrollbar_state = scrollbar_state.position(index);
+        let visible_rows = self.visible_rows();
 
-        let Some(lines) = *self.view_data.article_lines() else {
+        let scrollbar_state = self.view_data.scrollbar_state_mut();
+        *scrollbar_state = match visible_rows {
+            Some(visible_rows) => scrollbar_state
+                .position(index)
+                .viewport_content_length(visible_rows as usize),
+            None => scrollbar_state.position(index),
+        };
+
+        let Some(visible_rows) = visible_rows else {
             return;
         };
         let offset = self.view_data.get_table_state_mut().offset_mut();
-        let max_lines_above =
-            (lines as usize).saturating_sub(self.config.articles_after_selection + 1);
+        let max_rows_above =
+            (visible_rows as usize).saturating_sub(self.config.articles_after_selection + 1);
 
-        if index.saturating_sub(*offset) > max_lines_above {
-            *offset = index.saturating_sub(max_lines_above);
+        if index.saturating_sub(*offset) > max_rows_above {
+            *offset = index.saturating_sub(max_rows_above);
         }
     }
 
@@ -558,19 +576,17 @@ impl crate::messages::MessageReceiver for ArticlesList {
                     self.select_index_and_send_message(None)?;
                 }
                 C::NavigatePageUp if handle_command => {
-                    let lines = *self.view_data.article_lines();
-                    if let Some(lines) = lines {
+                    if let Some(rows) = self.visible_rows() {
                         self.view_data
                             .get_table_state_mut()
-                            .scroll_up_by(lines.saturating_sub(1));
+                            .scroll_up_by(rows.saturating_sub(1));
                         self.select_index_and_send_message(None)?;
                     };
                 }
                 C::NavigatePageDown if handle_command => {
-                    let lines = *self.view_data.article_lines();
-                    if let Some(lines) = lines {
+                    if let Some(rows) = self.visible_rows() {
                         self.view_data.get_table_state_mut().scroll_down_by(
-                            lines.saturating_sub(self.config.articles_after_selection as u16),
+                            rows.saturating_sub(self.config.articles_after_selection as u16),
                         );
                         self.select_index_and_send_message(None)?;
                     }
@@ -739,9 +755,11 @@ impl crate::messages::MessageReceiver for ArticlesList {
                 }
 
                 MouseArticleClick(row_offset) => {
-                    // Select the article at the clicked row offset
+                    // Select the article at the clicked row offset. The offset is a screen line,
+                    // and a row can span several of them.
+                    let row_height = (*self.view_data.row_height()).max(1) as usize;
                     let offset = self.view_data.get_table_state_mut().offset();
-                    let target_index = offset + *row_offset as usize;
+                    let target_index = offset + (*row_offset as usize) / row_height;
                     if target_index < self.model_data.articles().len() {
                         self.view_data
                             .get_table_state_mut()

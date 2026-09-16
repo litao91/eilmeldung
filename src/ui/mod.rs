@@ -64,11 +64,11 @@ pub struct App {
 
     panel_areas: PanelAreas,
 
-    /// When true, the user is dragging the horizontal border; stores the initial row of the drag.
+    /// When true, the user is dragging the border between the article list and the content.
     drag_resize_active: bool,
 
-    /// Override for the articles/content split height (absolute row count for articles list).
-    articles_height_override: Option<u16>,
+    /// Override for the articles/content split width (absolute column count for the article list).
+    articles_width_override: Option<u16>,
 }
 
 impl App {
@@ -128,7 +128,7 @@ impl App {
             is_offline: false,
             panel_areas: PanelAreas::default(),
             drag_resize_active: false,
-            articles_height_override: None,
+            articles_width_override: None,
         };
 
         info!("App instance created with initial state: FeedSelection");

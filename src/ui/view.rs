@@ -134,54 +134,43 @@ impl App {
             return;
         }
 
-        let (feeds_constraint_width, articles_constraint_width) = match self.state {
-            AppState::FeedSelection => (
-                self.config.feed_list_focused_width.as_constraint(),
-                self.config
-                    .feed_list_focused_width
-                    .as_complementary_constraint(area.width),
-            ),
-            _ => (
-                self.config
-                    .article_list_focused_width
-                    .as_complementary_constraint(area.width),
-                self.config.article_list_focused_width.as_constraint(),
-            ),
-        };
-
-        let (articles_constraint_height, article_content_constraint_height) =
-            if let Some(override_height) = self.articles_height_override {
-                // User is dragging the border — use absolute heights
-                (Constraint::Length(override_height), Constraint::Min(0))
-            } else {
-                match self.state {
-                    AppState::FeedSelection | AppState::ArticleSelection => (
-                        self.config.article_list_focused_height.as_constraint(),
-                        self.config
-                            .article_list_focused_height
-                            .as_complementary_constraint(area.height),
-                    ),
-                    _ => (
-                        self.config
-                            .article_content_focused_height
-                            .as_complementary_constraint(area.height),
-                        self.config.article_content_focused_height.as_constraint(),
-                    ),
-                }
+        // The focused panel takes its configured width; the other two share what is left in
+        // proportion to their own configured widths, so a configuration whose widths add up to
+        // 100% looks the same whichever panel is focused.
+        let (feeds_constraint_width, articles_constraint_width, content_constraint_width) =
+            match self.state {
+                AppState::FeedSelection => (
+                    self.config.feed_list_focused_width.as_constraint(),
+                    Constraint::Fill(self.config.article_list_focused_width.as_fill_weight()),
+                    Constraint::Fill(self.config.article_content_focused_width.as_fill_weight()),
+                ),
+                AppState::ArticleSelection => (
+                    Constraint::Fill(self.config.feed_list_focused_width.as_fill_weight()),
+                    self.config.article_list_focused_width.as_constraint(),
+                    Constraint::Fill(self.config.article_content_focused_width.as_fill_weight()),
+                ),
+                _ => (
+                    Constraint::Fill(self.config.feed_list_focused_width.as_fill_weight()),
+                    Constraint::Fill(self.config.article_list_focused_width.as_fill_weight()),
+                    self.config.article_content_focused_width.as_constraint(),
+                ),
             };
 
-        let [feeds_list_chunk, articles_chunk] = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints(vec![feeds_constraint_width, articles_constraint_width])
-            .areas::<2>(area);
+        // Dragging the border between the article list and the content pins the former's width.
+        let (articles_constraint_width, content_constraint_width) =
+            match self.articles_width_override {
+                Some(override_width) => (Constraint::Length(override_width), Constraint::Min(0)),
+                None => (articles_constraint_width, content_constraint_width),
+            };
 
-        let [articles_list_chunk, article_content_chunk] = Layout::default()
-            .direction(Direction::Vertical)
+        let [feeds_list_chunk, articles_list_chunk, article_content_chunk] = Layout::default()
+            .direction(Direction::Horizontal)
             .constraints([
-                articles_constraint_height,
-                article_content_constraint_height,
+                feeds_constraint_width,
+                articles_constraint_width,
+                content_constraint_width,
             ])
-            .areas::<2>(articles_chunk);
+            .areas::<3>(area);
 
         // store areas for mouse hit-testing
         *self.panel_areas.feed_list_mut() = feeds_list_chunk;

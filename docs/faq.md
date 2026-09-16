@@ -174,9 +174,9 @@ If you want to learn more, checkout [Key Bindings](keybindings.md#flagging-artic
 
 ### Can I open links/images in articles? Can eilmeldung display images in articles?
 
-Yes to both. Images within an article are displayed *inline* by default, as long as your terminal supports a graphics protocol (*kitty*, *iTerm2*, *sixel*); see [inline images](configuration.md#inline-images).
+Yes to both. Images within an article can be displayed *inline*, as long as your terminal supports a graphics protocol (*kitty*, *iTerm2*, *sixel*). They are off until asked for: press `p` (command `images`) in the article content to switch them on for that article; see [inline images](configuration.md#inline-images).
 
-Links — and images that could not be displayed — are shown as *hints*:
+Links — and images that are switched off or could not be displayed — are shown as *hints*:
 
 ![Image showing several link/image hints in the article content display of eilmeldung](images/hints.png)
 
@@ -274,7 +274,7 @@ thumbnail_height = "50%" # consumes 50% of the available vertical space
 ```
 ## How can I view/open images in articles?
 
-Images are displayed inline by default; see [inline images](configuration.md#inline-images). To open one in an external viewer instead — an image that could not be displayed, say, or one you want at full resolution — install an image viewer which can open links/URLs, like [feh](https://feh.finalrewind.org/). Then define a new share target for opening URL with `feh` in your `config.toml`
+Images can be displayed inline; see [inline images](configuration.md#inline-images). To open one in an external viewer instead — an image that could not be displayed, say, or one you want at full resolution — install an image viewer which can open links/URLs, like [feh](https://feh.finalrewind.org/). Then define a new share target for opening URL with `feh` in your `config.toml`
 ```toml
 share_targets = [
   "feh feh \"{url}\"", 

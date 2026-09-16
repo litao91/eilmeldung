@@ -32,7 +32,7 @@ tag_label = "{icon} {label} {unread_count}"
 query_label = "{icon} {label}"
 
 # Article Display
-article_table = "{flagged},{read},{marked},{tag_icons},{age},{title}"
+article_table = "{flagged},{read},{marked},{tag_icons},{age},{title},{summary}"
 date_format = "%m/%d %H:%M"
 articles_after_selection = 3
 hide_default_sort_order = true
@@ -52,17 +52,18 @@ thumbnail_fetch_debounce_millis = 500
 text_max_width = 66
 content_preferred_type = "markdown"
 content_fetcher = "readability"
-content_show_images = true
+content_show_images = false
 content_image_max_height = 12
 content_image_debounce_millis = 500
 
 # Layout
 # show_top_bar = true # deprecated, will be removed in future versions
 shadows = true
-feed_list_focused_width = "25%"
-article_list_focused_width = "75%"
-article_list_focused_height = "20%"
-article_content_focused_height = "80%"
+feed_list_focused_width = "20%"
+article_list_focused_width = "30%"
+article_content_focused_width = "50%"
+# article_list_focused_height = "20%" # deprecated, the panels are side by side now
+# article_content_focused_height = "80%" # deprecated, the panels are side by side now
 
 # Feed List
 feed_list = [
@@ -189,6 +190,7 @@ timeout_millis = 5000
 "q"         = ["confirm quit"]
 "C-c"       = ["quit"]
 "x"         = ["scrape"]
+"p"         = ["images"]
 "g f"       = ["focus feeds"]
 "g a"       = ["focus articles"]
 "g c"       = ["focus content"]

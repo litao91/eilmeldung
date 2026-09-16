@@ -534,7 +534,7 @@ impl ArticleContentViewData {
             font_width: font.width,
             font_height: font.height,
             max_image_rows: config.content_image_max_height,
-            show_images: config.content_show_images,
+            show_images: *model_data.content_images_enabled(),
         };
 
         if self.layout_key == Some(key) {
@@ -542,7 +542,7 @@ impl ArticleContentViewData {
         }
 
         let text = self.content_as_text(model_data, config);
-        let draw_images = config.content_show_images;
+        let draw_images = *model_data.content_images_enabled();
         let max_image_rows = config.content_image_max_height;
 
         let (rows, total_height) = build_rows(text, &self.content_image_order, width, |image| {
@@ -566,24 +566,16 @@ impl ArticleContentViewData {
         model_data: &ArticleContentModelData,
         config: &Config,
     ) -> Text<'static> {
-        // Only URLs discovered by a previous pass can be looked up, so a freshly loaded article
-        // renders its images as hint links first; once the downloads land, the content generation
-        // changes and this pass emits them as images instead.
-        //
-        // Images whose encoding failed are excluded so that they fall back to being a hint link
-        // rather than a blank gap.
-        let loaded_images = self
-            .discovered_image_urls
-            .iter()
-            .filter(|url| !self.failed_protocols.contains(*url))
-            .filter_map(|url| {
-                model_data
-                    .content_image_dimensions(url)
-                    .map(|dimensions| (url.clone(), dimensions))
-            })
+        // Snapshot of every image already downloaded, so the hook can tell a drawable image from
+        // one that still has to fall back to a hint link. Images whose encoding failed are left
+        // out so that they become a hint link again rather than a blank gap.
+        let loaded_images = model_data
+            .loaded_content_images()
+            .filter(|(url, _, _)| !self.failed_protocols.contains(*url))
+            .map(|(url, width, height)| (url.to_owned(), (width, height)))
             .collect::<HashMap<String, (u32, u32)>>();
 
-        let draw_images = config.content_show_images;
+        let draw_images = *model_data.content_images_enabled();
 
         // prefer filtered content
         if let Some(filtered_markdown_content) = model_data.filtered_markdown_content().as_deref() {
